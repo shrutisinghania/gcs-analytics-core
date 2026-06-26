@@ -18,6 +18,8 @@ package com.google.cloud.gcs.analyticscore.core.optimizer;
 
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import com.google.cloud.gcs.analyticscore.client.FakeGcsClientImpl;
 import com.google.cloud.gcs.analyticscore.client.FakeGcsFileSystemImpl;
@@ -322,5 +324,22 @@ class SmallObjectOptimizerTest {
     assertThat(result.remaining()).isEqualTo(20);
     assertThat(result.get()).isEqualTo((byte) 10);
     assertThat(result.get(19)).isEqualTo((byte) 29);
+  }
+
+  @Test
+  void read_uninitializedMetadataThrowsIOException_returnsZeroAndLetsDelegateRead()
+      throws IOException {
+    // Arrange
+    SmallObjectOptimizer uninitializedOptimizer = new SmallObjectOptimizer(readOptions, telemetry);
+    uninitializedOptimizer.onOpen(ITEM_ID, null);
+    VectoredSeekableByteChannel mockSource = mock(VectoredSeekableByteChannel.class);
+    when(mockSource.size()).thenThrow(new IOException("Object metadata not initialized"));
+    ByteBuffer dst = ByteBuffer.allocate(10);
+
+    // Act
+    int bytesRead = uninitializedOptimizer.read(0, dst, mockSource);
+
+    // Assert
+    assertThat(bytesRead).isEqualTo(0);
   }
 }

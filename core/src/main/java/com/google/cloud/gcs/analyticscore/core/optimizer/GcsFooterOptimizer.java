@@ -81,8 +81,13 @@ public class GcsFooterOptimizer implements FormatOptimizer {
   public int read(long position, ByteBuffer dst, VectoredSeekableByteChannel source)
       throws IOException {
     if (fileSize == -1) {
-      fileSize = source.size();
-      prefetchSize = calculatePrefetchSize(fileSize, readOptions);
+      try {
+        fileSize = source.size();
+        prefetchSize = calculatePrefetchSize(fileSize, readOptions);
+      } catch (IOException ignored) {
+        // Ignored: object metadata not yet resolved before initial read; let delegate perform read.
+        return 0;
+      }
     }
 
     if (prefetchSize <= 0 || position < (fileSize - prefetchSize)) {

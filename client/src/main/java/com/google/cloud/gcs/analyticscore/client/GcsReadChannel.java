@@ -36,6 +36,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.function.IntFunction;
+import javax.annotation.Nullable;
 
 class GcsReadChannel implements VectoredSeekableByteChannel {
   private Storage storage;
@@ -124,6 +125,9 @@ class GcsReadChannel implements VectoredSeekableByteChannel {
   private int readNextChunk(ByteBuffer dst) throws IOException {
     ReadChannel sdkChannel = strategy.getReadChannel(gcsReadChannelPosition, dst.remaining());
     int bytesRead = sdkChannel.read(dst);
+    if (this.itemInfo == null) {
+      extractMetadataAfterRead();
+    }
     if (bytesRead >= 0) {
       gcsReadChannelPosition += bytesRead;
       strategy.position(gcsReadChannelPosition);
@@ -247,6 +251,9 @@ class GcsReadChannel implements VectoredSeekableByteChannel {
             int numOfBytesRead = 0;
             while (dataBuffer.hasRemaining()) {
               int bytesRead = channel.read(dataBuffer);
+              if (GcsReadChannel.this.itemInfo == null) {
+                extractMetadataAfterRead(readStrategy);
+              }
               if (bytesRead < 0) {
                 // EOF reached.
                 break;
@@ -320,5 +327,146 @@ class GcsReadChannel implements VectoredSeekableByteChannel {
           String.format(
               "Invalid seek offset: position value (%d) must be >= 0 for '%s'", position, itemId));
     }
+  }
+
+  private boolean extractMetadataAfterRead() {
+    return extractMetadataAfterRead(this.strategy);
+  }
+
+  private synchronized boolean extractMetadataAfterRead(@Nullable ReadStrategy strat) {
+    if (this.itemInfo != null) {
+      return true;
+    }
+    if (strat == null || strat.getSdkReadChannel() == null) {
+      return false;
+    }
+    Object resolvedMetadata = resolveMetadataObject(strat.getSdkReadChannel());
+    if (resolvedMetadata == null) {
+      return false;
+    }
+    long extractedSize = extractLongProperty(resolvedMetadata, "getSize", "size");
+    if (extractedSize < 0) {
+      return false;
+    }
+    long extractedGen = extractLongProperty(resolvedMetadata, "getGeneration", "generation");
+    updateItemMetadata(extractedSize, extractedGen);
+    return true;
+  }
+
+  private void updateItemMetadata(long extractedSize, long extractedGen) {
+    GcsItemId.Builder itemIdBuilder =
+        GcsItemId.builder().setBucketName(this.itemId.getBucketName());
+    this.itemId.getObjectName().ifPresent(itemIdBuilder::setObjectName);
+    long genToSet = extractedGen > 0 ? extractedGen : this.itemId.getContentGeneration().orElse(0L);
+    if (genToSet > 0) {
+      itemIdBuilder.setContentGeneration(genToSet);
+    }
+    GcsItemId updatedItemId = itemIdBuilder.build();
+    GcsItemInfo.Builder itemInfoBuilder =
+        GcsItemInfo.builder().setItemId(updatedItemId).setSize(extractedSize);
+    if (genToSet > 0) {
+      itemInfoBuilder.setContentGeneration(genToSet);
+    } else {
+      itemInfoBuilder.setContentGeneration(0L);
+    }
+    this.itemInfo = itemInfoBuilder.build();
+    this.itemId = updatedItemId;
+  }
+
+  @Nullable
+  private Object resolveMetadataObject(ReadChannel sdkChannel) {
+    Class<?> clazz = sdkChannel.getClass();
+    while (clazz != null) {
+      for (String methodName :
+          new String[] {
+            "getObject", "getResolvedObject", "getBlobInfo", "getBlob", "getStorageObject"
+          }) {
+        try {
+          java.lang.reflect.Method method = clazz.getDeclaredMethod(methodName);
+          method.setAccessible(true);
+          Object res = resolveFutureIfNeeded(method.invoke(sdkChannel));
+          if (res != null) {
+            return res;
+          }
+        } catch (ReflectiveOperationException ignored) {
+          // Ignored: method not present on this SDK channel implementation class.
+        }
+      }
+      for (String fieldName : new String[] {"storageObject", "blobInfo", "object", "result"}) {
+        try {
+          java.lang.reflect.Field field = clazz.getDeclaredField(fieldName);
+          field.setAccessible(true);
+          Object val = resolveFutureIfNeeded(field.get(sdkChannel));
+          if (val != null) {
+            return val;
+          }
+        } catch (ReflectiveOperationException ignored) {
+          // Ignored: field not present on this SDK channel implementation class.
+        }
+      }
+      clazz = clazz.getSuperclass();
+    }
+    return null;
+  }
+
+  @Nullable
+  private Object resolveFutureIfNeeded(@Nullable Object obj) throws ReflectiveOperationException {
+    if (obj instanceof java.util.concurrent.Future) {
+      java.util.concurrent.Future<?> future = (java.util.concurrent.Future<?>) obj;
+      if (future.isDone()) {
+        try {
+          return future.get();
+        } catch (java.util.concurrent.ExecutionException ignored) {
+          // Ignored: future execution failed or cancelled.
+          return null;
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          return null;
+        }
+      }
+      return null;
+    }
+    return obj;
+  }
+
+  private long extractLongProperty(Object target, String primaryGetter, String fallbackGetter) {
+    for (java.lang.reflect.Method m : target.getClass().getMethods()) {
+      if (m.getParameterCount() == 0 && m.getName().equals(primaryGetter)) {
+        long val = invokeLongGetter(target, m);
+        if (val >= 0) {
+          return val;
+        }
+      }
+    }
+    if (!(target instanceof java.util.Map)) {
+      for (java.lang.reflect.Method m : target.getClass().getMethods()) {
+        if (m.getParameterCount() == 0 && m.getName().equals(fallbackGetter)) {
+          long val = invokeLongGetter(target, m);
+          if (val >= 0) {
+            return val;
+          }
+        }
+      }
+    }
+    return -1L;
+  }
+
+  private long invokeLongGetter(Object target, java.lang.reflect.Method method) {
+    try {
+      method.setAccessible(true);
+      Object result = method.invoke(target);
+      if (result instanceof Number) {
+        return ((Number) result).longValue();
+      } else if (result != null) {
+        try {
+          return Long.parseLong(result.toString());
+        } catch (NumberFormatException ignored) {
+          // Ignored: return value string is not parseable as a long integer.
+        }
+      }
+    } catch (ReflectiveOperationException ignored) {
+      // Ignored: getter method invocation failed or inaccessible.
+    }
+    return -1L;
   }
 }

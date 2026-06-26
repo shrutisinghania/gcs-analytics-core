@@ -333,4 +333,21 @@ class GcsFooterOptimizerTest {
     verify(telemetry, times(1)).recordMetric(eq(Metric.FOOTER_CACHE_MISS), eq(1L), any());
     verify(telemetry, times(1)).recordMetric(eq(Metric.FOOTER_PREFETCH_HIT), eq(1L), any());
   }
+
+  @Test
+  void read_uninitializedMetadataThrowsIOException_returnsZeroAndLetsDelegateRead()
+      throws IOException {
+    // Arrange
+    GcsFooterOptimizer uninitializedOptimizer = new GcsFooterOptimizer(readOptions, telemetry);
+    uninitializedOptimizer.onOpen(ITEM_ID, mockCacheManager);
+    VectoredSeekableByteChannel mockSource = mock(VectoredSeekableByteChannel.class);
+    when(mockSource.size()).thenThrow(new IOException("Object metadata not initialized"));
+    ByteBuffer dst = ByteBuffer.allocate(10);
+
+    // Act
+    int bytesRead = uninitializedOptimizer.read(0, dst, mockSource);
+
+    // Assert
+    assertThat(bytesRead).isEqualTo(0);
+  }
 }

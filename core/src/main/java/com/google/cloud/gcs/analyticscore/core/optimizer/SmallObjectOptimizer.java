@@ -82,7 +82,12 @@ public class SmallObjectOptimizer implements FormatOptimizer {
   public int read(long position, ByteBuffer dst, VectoredSeekableByteChannel source)
       throws IOException {
     if (fileSize == -1) {
-      fileSize = source.size();
+      try {
+        fileSize = source.size();
+      } catch (IOException ignored) {
+        // Ignored: object metadata not yet resolved before initial read; let delegate perform read.
+        return 0;
+      }
     }
 
     if (fileSize > readOptions.getSmallObjectCacheSize()) {

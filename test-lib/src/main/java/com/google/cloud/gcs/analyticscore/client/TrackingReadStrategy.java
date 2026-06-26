@@ -18,6 +18,7 @@ package com.google.cloud.gcs.analyticscore.client;
 
 import com.google.cloud.ReadChannel;
 import java.io.IOException;
+import javax.annotation.Nullable;
 
 public class TrackingReadStrategy implements ReadStrategy {
   private final ReadStrategy delegate;
@@ -33,6 +34,12 @@ public class TrackingReadStrategy implements ReadStrategy {
 
   public void setEofAtCall(int eofAtCall) {
     this.eofAtCall = eofAtCall;
+  }
+
+  @Override
+  @Nullable
+  public ReadChannel getSdkReadChannel() {
+    return delegate.getSdkReadChannel();
   }
 
   @Override

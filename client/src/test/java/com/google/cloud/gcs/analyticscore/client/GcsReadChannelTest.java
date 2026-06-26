@@ -945,4 +945,41 @@ class GcsReadChannelTest {
       throws ExecutionException, InterruptedException {
     return StandardCharsets.UTF_8.decode(range.getByteBufferFuture().get()).toString();
   }
+
+  public interface ReflectiveReadChannel extends ReadChannel {
+    com.google.api.services.storage.model.StorageObject getStorageObject();
+  }
+
+  @Test
+  void read_withoutItemInfo_extractsMetadataViaReflection() throws IOException {
+    // Arrange
+    GcsItemId itemId =
+        GcsItemId.builder().setBucketName("test-bucket").setObjectName("test-object").build();
+    String objectData = "hello world";
+    Storage mockStorage = Mockito.mock(Storage.class);
+    ReflectiveReadChannel mockReadChannel = Mockito.mock(ReflectiveReadChannel.class);
+    Mockito.when(
+            mockStorage.reader(
+                Mockito.any(BlobId.class), Mockito.any(Storage.BlobSourceOption[].class)))
+        .thenReturn(mockReadChannel);
+    Mockito.when(mockReadChannel.isOpen()).thenReturn(true);
+    Mockito.when(mockReadChannel.read(Mockito.any(ByteBuffer.class))).thenReturn(5);
+
+    com.google.api.services.storage.model.StorageObject storageObject =
+        new com.google.api.services.storage.model.StorageObject()
+            .setSize(java.math.BigInteger.valueOf(objectData.length()))
+            .setGeneration(123L);
+    Mockito.when(mockReadChannel.getStorageObject()).thenReturn(storageObject);
+
+    GcsReadChannel gcsReadChannel =
+        new GcsReadChannel(
+            mockStorage, itemId, TEST_GCS_READ_OPTIONS, executorServiceSupplier, telemetry);
+
+    // Act
+    ByteBuffer buffer = ByteBuffer.allocate(5);
+    gcsReadChannel.read(buffer);
+
+    // Assert
+    assertThat(gcsReadChannel.size()).isEqualTo(objectData.length());
+  }
 }
