@@ -49,7 +49,7 @@ public class GoogleCloudStorageInputStream extends SeekableInputStream {
 
   private volatile boolean closed;
 
-  private GcsFileInfo gcsFileInfo;
+  private volatile GcsFileInfo gcsFileInfo;
 
   public static GoogleCloudStorageInputStream create(
       GcsFileSystem gcsFileSystem, GcsFileInfo gcsFileInfo) throws IOException {
@@ -223,12 +223,20 @@ public class GoogleCloudStorageInputStream extends SeekableInputStream {
             Metric.READ_DURATION,
             commonAttributes,
             recorder -> {
-              if (gcsFileInfo == null) {
-                gcsFileInfo = gcsFileSystem.getFileInfo(gcsItemId);
-              }
               try (VectoredSeekableByteChannel byteChannel =
                   openReadChannel(gcsFileSystem, gcsItemId, gcsFileInfo)) {
-                long size = gcsFileInfo.getItemInfo().getSize();
+                long size =
+                    gcsFileInfo != null ? gcsFileInfo.getItemInfo().getSize() : byteChannel.size();
+                if (gcsFileInfo == null
+                    && byteChannel.getItemInfo() != null
+                    && byteChannel.getItemInfo().exists()) {
+                  this.gcsFileInfo =
+                      GcsFileInfo.builder()
+                          .setItemInfo(byteChannel.getItemInfo())
+                          .setUri(gcsPath)
+                          .setAttributes(ImmutableMap.of())
+                          .build();
+                }
                 long startPosition = Math.max(0, size - length);
                 byteChannel.position(startPosition);
                 int bytesRead = byteChannel.read(ByteBuffer.wrap(buffer, offset, length));

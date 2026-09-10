@@ -19,7 +19,6 @@ import com.google.cloud.ReadChannel;
 import com.google.common.collect.ImmutableList;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.util.Arrays;
 import java.util.Collection;
 import java.util.Map;
 import java.util.concurrent.CancellationException;
@@ -37,10 +36,21 @@ final class GcsReadChannelMetadataExtractor {
 
   private static final ImmutableList<String> METADATA_METHOD_NAMES =
       ImmutableList.of(
-          "getObject", "getResolvedObject", "getBlobInfo", "getBlob", "getStorageObject");
+          "getResolvedObject", "getObject", "getBlobInfo", "getBlob", "getStorageObject");
 
   private static final ImmutableList<String> METADATA_FIELD_NAMES =
-      ImmutableList.of("storageObject", "blobInfo", "object", "result");
+      ImmutableList.of("result", "blobInfo", "storageObject", "object");
+
+  private static final ImmutableList<String> WRAPPER_FIELD_NAMES =
+      ImmutableList.of(
+          "reader",
+          "delegate",
+          "channel",
+          "wrapped",
+          "in",
+          "readChannel",
+          "lazyReadChannel",
+          "session");
 
   private GcsReadChannelMetadataExtractor() {}
 
@@ -63,49 +73,83 @@ final class GcsReadChannelMetadataExtractor {
   }
 
   @Nullable
-  static ExtractedMetadata extract(@Nullable ReadChannel sdkChannel) {
-    if (sdkChannel == null) {
+  static ExtractedMetadata extract(@Nullable Object channelOrTarget) {
+    if (channelOrTarget == null) {
       return null;
     }
-    Object resolvedMetadata = resolveMetadataObject(sdkChannel);
-    if (resolvedMetadata == null) {
-      return null;
-    }
-    long extractedSize = extractLongProperty(resolvedMetadata, "getSize", "size");
-    if (extractedSize < 0) {
-      return null;
-    }
-    long extractedGeneration = extractLongProperty(resolvedMetadata, "getGeneration", "generation");
-    return new ExtractedMetadata(extractedSize, extractedGeneration);
+    return resolveMetadata(channelOrTarget, 0);
   }
 
   @Nullable
-  private static Object resolveMetadataObject(ReadChannel sdkChannel) {
-    Class<?> clazz = sdkChannel.getClass();
-    while (clazz != null) {
+  private static ExtractedMetadata tryExtractMetadata(@Nullable Object obj) {
+    if (obj == null) {
+      return null;
+    }
+    long size = extractLongProperty(obj, "getSize", "size");
+    if (size < 0) {
+      return null;
+    }
+    long generation = extractLongProperty(obj, "getGeneration", "generation");
+    return new ExtractedMetadata(size, generation);
+  }
+
+  @Nullable
+  private static ExtractedMetadata resolveMetadata(@Nullable Object target, int depth) {
+    if (target == null || depth > 5) {
+      return null;
+    }
+    Class<?> clazz = target.getClass();
+
+    while (clazz != null && clazz != Object.class) {
       for (String methodName : METADATA_METHOD_NAMES) {
+        Method method = findDeclaredMethod(clazz, methodName);
+        if (method == null) {
+          continue;
+        }
         try {
-          Method method = clazz.getDeclaredMethod(methodName);
           method.setAccessible(true);
-          Object resolvedMetadata = resolveFutureIfNeeded(method.invoke(sdkChannel));
-          if (resolvedMetadata != null) {
-            return resolvedMetadata;
+          Object raw = method.invoke(target);
+          ExtractedMetadata metadata = tryExtractMetadata(resolveFutureIfNeeded(raw));
+          if (metadata != null) {
+            return metadata;
           }
-        } catch (ReflectiveOperationException | RuntimeException ignored) {
-          LOG.debug(
-              "Method {} not present or inaccessible on class {}", methodName, clazz.getName());
+        } catch (ReflectiveOperationException | RuntimeException e) {
+          LOG.debug("Failed invoking method {} on {}", methodName, clazz.getName(), e);
         }
       }
       for (String fieldName : METADATA_FIELD_NAMES) {
+        Field field = findDeclaredField(clazz, fieldName);
+        if (field == null) {
+          continue;
+        }
         try {
-          Field field = clazz.getDeclaredField(fieldName);
           field.setAccessible(true);
-          Object resolvedMetadata = resolveFutureIfNeeded(field.get(sdkChannel));
-          if (resolvedMetadata != null) {
-            return resolvedMetadata;
+          Object raw = field.get(target);
+          ExtractedMetadata metadata = tryExtractMetadata(resolveFutureIfNeeded(raw));
+          if (metadata != null) {
+            return metadata;
           }
-        } catch (ReflectiveOperationException | RuntimeException ignored) {
-          LOG.debug("Field {} not present or inaccessible on class {}", fieldName, clazz.getName());
+        } catch (ReflectiveOperationException | RuntimeException e) {
+          LOG.debug("Failed reading field {} on {}", fieldName, clazz.getName(), e);
+        }
+      }
+      for (String wrapperFieldName : WRAPPER_FIELD_NAMES) {
+        Field field = findDeclaredField(clazz, wrapperFieldName);
+        if (field == null) {
+          continue;
+        }
+        try {
+          field.setAccessible(true);
+          Object inner = field.get(target);
+          if (inner != null && inner != target) {
+            ExtractedMetadata metadata = resolveMetadata(inner, depth + 1);
+            if (metadata != null) {
+              return metadata;
+            }
+          }
+        } catch (ReflectiveOperationException | RuntimeException e) {
+          LOG.debug(
+              "Failed unwrapping wrapper field {} on {}", wrapperFieldName, clazz.getName(), e);
         }
       }
       clazz = clazz.getSuperclass();
@@ -114,8 +158,28 @@ final class GcsReadChannelMetadataExtractor {
   }
 
   @Nullable
-  private static Object resolveFutureIfNeeded(@Nullable Object obj)
-      throws ReflectiveOperationException {
+  private static Method findDeclaredMethod(Class<?> clazz, String methodName) {
+    try {
+      return clazz.getDeclaredMethod(methodName);
+    } catch (NoSuchMethodException ignored) {
+      return null;
+    }
+  }
+
+  @Nullable
+  private static Field findDeclaredField(Class<?> clazz, String fieldName) {
+    try {
+      return clazz.getDeclaredField(fieldName);
+    } catch (NoSuchFieldException ignored) {
+      return null;
+    }
+  }
+
+  @Nullable
+  private static Object resolveFutureIfNeeded(@Nullable Object obj) {
+    if (obj == null) {
+      return null;
+    }
     if (!(obj instanceof Future)) {
       return obj;
     }
@@ -125,10 +189,8 @@ final class GcsReadChannelMetadataExtractor {
     }
     try {
       return future.get();
-    } catch (CancellationException | ExecutionException ignored) {
-      // If the future failed or was cancelled, it is safe to fallback to null and attempt
-      // field-based metadata extraction instead.
-      LOG.debug("Future execution failed or was cancelled", ignored);
+    } catch (CancellationException | ExecutionException e) {
+      LOG.debug("Future execution failed or was cancelled", e);
       return null;
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
@@ -136,27 +198,53 @@ final class GcsReadChannelMetadataExtractor {
     }
   }
 
+  private static boolean isExcludedFallbackTarget(Object target) {
+    return target instanceof Map
+        || target instanceof Collection
+        || target instanceof CharSequence
+        || target instanceof Number
+        || target.getClass().getName().startsWith("java.util.")
+        || target.getClass().getName().startsWith("com.google.common.collect.");
+  }
+
   private static long extractLongProperty(
       Object target, String primaryGetter, String fallbackGetter) {
-    long value =
-        Arrays.stream(target.getClass().getMethods())
-            .filter(m -> m.getParameterCount() == 0 && m.getName().equals(primaryGetter))
-            .mapToLong(m -> invokeLongGetter(target, m))
-            .filter(v -> v >= 0)
-            .findFirst()
-            .orElse(-1L);
-    if (value >= 0) {
-      return value;
+    Method primaryMethod = findMethod(target.getClass(), primaryGetter);
+    if (primaryMethod != null) {
+      long val = invokeLongGetter(target, primaryMethod);
+      if (val >= 0) {
+        return val;
+      }
     }
-    if (target instanceof Map || target instanceof Collection) {
+    if (isExcludedFallbackTarget(target)) {
       return -1L;
     }
-    return Arrays.stream(target.getClass().getMethods())
-        .filter(m -> m.getParameterCount() == 0 && m.getName().equals(fallbackGetter))
-        .mapToLong(m -> invokeLongGetter(target, m))
-        .filter(v -> v >= 0)
-        .findFirst()
-        .orElse(-1L);
+    Method fallbackMethod = findMethod(target.getClass(), fallbackGetter);
+    if (fallbackMethod != null) {
+      long val = invokeLongGetter(target, fallbackMethod);
+      if (val >= 0) {
+        return val;
+      }
+    }
+    return -1L;
+  }
+
+  @Nullable
+  private static Method findMethod(Class<?> clazz, String methodName) {
+    try {
+      return clazz.getMethod(methodName);
+    } catch (NoSuchMethodException | SecurityException ignored) {
+      // Fall through to declared method search
+    }
+    Class<?> current = clazz;
+    while (current != null && current != Object.class) {
+      Method m = findDeclaredMethod(current, methodName);
+      if (m != null) {
+        return m;
+      }
+      current = current.getSuperclass();
+    }
+    return null;
   }
 
   private static long invokeLongGetter(Object target, Method method) {
@@ -166,7 +254,7 @@ final class GcsReadChannelMetadataExtractor {
       if (value instanceof Number) {
         return ((Number) value).longValue();
       }
-    } catch (ReflectiveOperationException | RuntimeException ignored) {
+    } catch (ReflectiveOperationException | RuntimeException e) {
       LOG.debug(
           "Getter invocation failed or inaccessible for method {} on target {}",
           method.getName(),

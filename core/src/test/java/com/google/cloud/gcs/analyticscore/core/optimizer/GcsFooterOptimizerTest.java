@@ -19,8 +19,12 @@ package com.google.cloud.gcs.analyticscore.core.optimizer;
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -43,8 +47,10 @@ import com.google.cloud.storage.BlobInfo;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.net.URI;
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -343,5 +349,242 @@ class GcsFooterOptimizerTest {
     int bytesRead = optimizer.read(990, dst, mockSource);
 
     assertThat(bytesRead).isEqualTo(0);
+  }
+
+  @Test
+  void read_fileSizeUninitialized_probeLoadsAndCachesFooter() throws IOException {
+    optimizer.onOpen(ITEM_ID, mockCacheManager);
+    when(mockCacheManager.getFooter(eq(ITEM_ID), any()))
+        .thenAnswer(
+            invocation -> {
+              AnalyticsCacheManager.FooterLoader loader = invocation.getArgument(1);
+              return loader.load(ITEM_ID);
+            });
+    ByteBuffer dst = ByteBuffer.allocate(10);
+
+    int bytesRead = optimizer.read(990, dst, realSource);
+
+    assertThat(bytesRead).isEqualTo(10);
+    assertThat(dst.array()[0]).isEqualTo(testData[990]);
+  }
+
+  @Test
+  void read_fileSizeUninitialized_cacheHit_resolvesFileSizeAndServesFromCache() throws IOException {
+    optimizer.onOpen(ITEM_ID, mockCacheManager);
+    ByteBuffer cachedFooter = ByteBuffer.wrap(Arrays.copyOfRange(testData, 900, 1000));
+    when(mockCacheManager.getFooter(eq(ITEM_ID), any())).thenReturn(cachedFooter);
+    ByteBuffer dst = ByteBuffer.allocate(10);
+
+    int bytesRead = optimizer.read(990, dst, realSource);
+
+    assertThat(bytesRead).isEqualTo(10);
+    assertThat(dst.array()[0]).isEqualTo(testData[990]);
+    verify(telemetry, times(1)).recordMetric(eq(Metric.FOOTER_CACHE_HIT), eq(1L), any());
+  }
+
+  @Test
+  void read_positionZero_fileSizeUninitialized_returnsZero() throws IOException {
+    optimizer.onOpen(ITEM_ID, mockCacheManager);
+    VectoredSeekableByteChannel mockSource = mock(VectoredSeekableByteChannel.class);
+    when(mockSource.getItemInfo()).thenReturn(null);
+    ByteBuffer dst = ByteBuffer.allocate(10);
+
+    int bytesRead = optimizer.read(0, dst, mockSource);
+
+    assertThat(bytesRead).isEqualTo(0);
+  }
+
+  @Test
+  void read_fileSizeUninitialized_zeroByteProbeResolvesSizeAndPrefetches() throws IOException {
+    optimizer.onOpen(ITEM_ID, mockCacheManager);
+    when(mockCacheManager.getFooter(eq(ITEM_ID), any()))
+        .thenAnswer(
+            invocation -> {
+              AnalyticsCacheManager.FooterLoader loader = invocation.getArgument(1);
+              return loader.load(ITEM_ID);
+            });
+
+    VectoredSeekableByteChannel mockSource = mock(VectoredSeekableByteChannel.class);
+    when(mockSource.getItemInfo()).thenReturn(null);
+    when(mockSource.position()).thenReturn(990L);
+    doAnswer(
+            inv -> {
+              when(mockSource.getItemInfo()).thenReturn(ITEM_INFO);
+              return 0;
+            })
+        .when(mockSource)
+        .read(argThat(buf -> buf != null && buf.remaining() == 0));
+    when(mockSource.read(argThat(buf -> buf != null && buf.remaining() > 0)))
+        .thenAnswer(
+            inv -> {
+              ByteBuffer buf = inv.getArgument(0);
+              int len = Math.min(buf.remaining(), testData.length - 900);
+              buf.put(testData, 900, len);
+              return len;
+            });
+
+    ByteBuffer dst = ByteBuffer.allocate(10);
+    int bytesRead = optimizer.read(990, dst, mockSource);
+
+    assertThat(bytesRead).isEqualTo(10);
+    assertThat(dst.array()[0]).isEqualTo(testData[990]);
+    verify(mockSource).read(argThat(buf -> buf != null && buf.remaining() == 0));
+  }
+
+  @Test
+  void read_fileSizeUninitialized_zeroByteProbeFailsToResolve_returnsZero() throws IOException {
+    optimizer.onOpen(ITEM_ID, mockCacheManager);
+    VectoredSeekableByteChannel mockSource = mock(VectoredSeekableByteChannel.class);
+    when(mockSource.getItemInfo()).thenReturn(null);
+    ByteBuffer dst = ByteBuffer.allocate(10);
+
+    int bytesRead = optimizer.read(990, dst, mockSource);
+
+    assertThat(bytesRead).isEqualTo(0);
+    verify(mockCacheManager, never()).getFooter(any(), any());
+  }
+
+  @Test
+  void loadFooter_eofDuringRead_throwsIOException() throws IOException {
+    optimizer.onOpen(FILE_INFO, mockCacheManager);
+    when(mockCacheManager.getFooter(eq(ITEM_ID), any()))
+        .thenAnswer(
+            invocation -> {
+              AnalyticsCacheManager.FooterLoader loader = invocation.getArgument(1);
+              return loader.load(ITEM_ID);
+            });
+    VectoredSeekableByteChannel mockSource = mock(VectoredSeekableByteChannel.class);
+    when(mockSource.read(any(ByteBuffer.class))).thenReturn(-1);
+    ByteBuffer dst = ByteBuffer.allocate(10);
+
+    IOException e = assertThrows(IOException.class, () -> optimizer.read(990, dst, mockSource));
+
+    assertThat(e).hasMessageThat().contains("Unexpected EOF");
+  }
+
+  @Test
+  void read_cacheLoaderThrowsIOException_unwrappedAndRethrown() throws IOException {
+    optimizer.onOpen(ITEM_ID, mockCacheManager);
+    when(mockCacheManager.getFooter(eq(ITEM_ID), any()))
+        .thenThrow(new UncheckedIOException(new IOException("Simulated network failure")));
+    ByteBuffer dst = ByteBuffer.allocate(10);
+
+    IOException e = assertThrows(IOException.class, () -> optimizer.read(990, dst, realSource));
+
+    assertThat(e).hasMessageThat().contains("Simulated network failure");
+  }
+
+  @Test
+  void read_fileSizeUninitialized_updatesGcsItemIdWithGenerationFromProbe() throws IOException {
+    optimizer.onOpen(ITEM_ID, mockCacheManager);
+    GcsItemId idWithGen =
+        GcsItemId.builder()
+            .setBucketName(ITEM_ID.getBucketName())
+            .setObjectName(ITEM_ID.getObjectName().get())
+            .setContentGeneration(888L)
+            .build();
+    GcsItemInfo infoWithGen = GcsItemInfo.builder().setItemId(idWithGen).setSize(1000).build();
+
+    when(mockCacheManager.getFooter(eq(idWithGen), any()))
+        .thenAnswer(
+            invocation -> {
+              AnalyticsCacheManager.FooterLoader loader = invocation.getArgument(1);
+              return loader.load(idWithGen);
+            });
+
+    VectoredSeekableByteChannel mockSource = mock(VectoredSeekableByteChannel.class);
+    when(mockSource.getItemInfo()).thenReturn(null);
+    when(mockSource.position()).thenReturn(990L);
+    doAnswer(
+            inv -> {
+              when(mockSource.getItemInfo()).thenReturn(infoWithGen);
+              return 0;
+            })
+        .when(mockSource)
+        .read(argThat(buf -> buf != null && buf.remaining() == 0));
+    when(mockSource.read(argThat(buf -> buf != null && buf.remaining() > 0)))
+        .thenAnswer(
+            inv -> {
+              ByteBuffer buf = inv.getArgument(0);
+              int len = Math.min(buf.remaining(), testData.length - 900);
+              buf.put(testData, 900, len);
+              return len;
+            });
+
+    ByteBuffer dst = ByteBuffer.allocate(10);
+    int bytesRead = optimizer.read(990, dst, mockSource);
+
+    assertThat(bytesRead).isEqualTo(10);
+    verify(mockCacheManager).getFooter(eq(idWithGen), any());
+  }
+
+  @Test
+  void read_fileSizeUninitialized_sourceReadThrowsIOException_propagatesIOException()
+      throws IOException {
+    optimizer.onOpen(ITEM_ID, mockCacheManager);
+    VectoredSeekableByteChannel mockSource = mock(VectoredSeekableByteChannel.class);
+    when(mockSource.getItemInfo()).thenReturn(null);
+    doThrow(new IOException("Fatal network error during probe"))
+        .when(mockSource)
+        .read(argThat((ByteBuffer buf) -> buf != null && buf.remaining() == 0));
+    ByteBuffer dst = ByteBuffer.allocate(10);
+
+    IOException e = assertThrows(IOException.class, () -> optimizer.read(990, dst, mockSource));
+
+    assertThat(e).hasMessageThat().contains("Fatal network error during probe");
+  }
+
+  @Test
+  void read_fileSizeUninitialized_zeroByteProbeFailsToResolve_secondCallDoesNotRetryProbe()
+      throws IOException {
+    optimizer.onOpen(ITEM_ID, mockCacheManager);
+    VectoredSeekableByteChannel mockSource = mock(VectoredSeekableByteChannel.class);
+    when(mockSource.getItemInfo()).thenReturn(null);
+    ByteBuffer dst = ByteBuffer.allocate(10);
+
+    optimizer.read(990, dst, mockSource);
+    optimizer.read(990, dst, mockSource);
+
+    verify(mockSource, times(1)).read(argThat(buf -> buf != null && buf.remaining() == 0));
+  }
+
+  @Test
+  void read_positionPastEof_returnsMinusOneAndDoesNotPrefetchFooter() throws IOException {
+    optimizer.onOpen(FILE_INFO, mockCacheManager);
+    ByteBuffer dst = ByteBuffer.allocate(10);
+
+    int bytesRead = optimizer.read(1050, dst, realSource);
+
+    assertThat(bytesRead).isEqualTo(-1);
+    verify(mockCacheManager, never()).getFooter(any(), any());
+  }
+
+  @Test
+  void read_positionPastEof_emptyBuffer_returnsZero() throws IOException {
+    optimizer.onOpen(FILE_INFO, mockCacheManager);
+    ByteBuffer emptyBuffer = ByteBuffer.allocate(0);
+
+    int bytesRead = optimizer.read(1050, emptyBuffer, realSource);
+
+    assertThat(bytesRead).isEqualTo(0);
+    verify(mockCacheManager, never()).getFooter(any(), any());
+  }
+
+  @Test
+  void loadFooter_zeroBytesRead_throwsIOException() throws IOException {
+    optimizer.onOpen(FILE_INFO, mockCacheManager);
+    when(mockCacheManager.getFooter(eq(ITEM_ID), any()))
+        .thenAnswer(
+            invocation -> {
+              AnalyticsCacheManager.FooterLoader loader = invocation.getArgument(1);
+              return loader.load(ITEM_ID);
+            });
+    VectoredSeekableByteChannel mockSource = mock(VectoredSeekableByteChannel.class);
+    when(mockSource.read(any(ByteBuffer.class))).thenReturn(0);
+    ByteBuffer dst = ByteBuffer.allocate(10);
+
+    IOException e = assertThrows(IOException.class, () -> optimizer.read(990, dst, mockSource));
+
+    assertThat(e).hasMessageThat().contains("Zero bytes read");
   }
 }

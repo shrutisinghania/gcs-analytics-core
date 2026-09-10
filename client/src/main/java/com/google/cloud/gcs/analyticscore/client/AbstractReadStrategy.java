@@ -28,10 +28,10 @@ import java.util.List;
 import javax.annotation.Nullable;
 
 abstract class AbstractReadStrategy implements ReadStrategy {
-  protected final GcsItemId itemId;
+  protected volatile GcsItemId itemId;
   protected final GcsReadOptions options;
   protected final Storage storage;
-  protected final GcsItemInfo itemInfo;
+  protected volatile GcsItemInfo itemInfo;
 
   private static final int SKIP_BUFFER_SIZE = 128 * 1024; // 128 KiB
   private ByteBuffer skipBuffer;
@@ -45,6 +45,13 @@ abstract class AbstractReadStrategy implements ReadStrategy {
     this.itemId = itemId;
     this.options = options;
     this.itemInfo = itemInfo;
+  }
+
+  void updateItemInfo(GcsItemInfo itemInfo) {
+    this.itemInfo = itemInfo;
+    if (itemInfo != null && itemInfo.getItemId() != null) {
+      this.itemId = itemInfo.getItemId();
+    }
   }
 
   @Override
@@ -72,7 +79,7 @@ abstract class AbstractReadStrategy implements ReadStrategy {
       return position >= itemInfo.getSize();
     }
 
-    return true;
+    return getLimit() == Long.MAX_VALUE || position >= getLimit();
   }
 
   ReadChannel openSdkReadChannel() throws IOException {

@@ -29,6 +29,7 @@ import com.google.common.base.Supplier;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import java.io.EOFException;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
@@ -138,6 +139,9 @@ class GcsReadChannel implements VectoredSeekableByteChannel {
   public int read(ByteBuffer dst) throws IOException {
     checkChannelOpen();
     if (dst.remaining() == 0) {
+      if (itemInfo == null) {
+        readNextChunk(dst);
+      }
       return 0;
     }
     int totalBytesRead = 0;
@@ -156,11 +160,23 @@ class GcsReadChannel implements VectoredSeekableByteChannel {
     ReadChannel sdkChannel = strategy.getReadChannel(gcsReadChannelPosition, dst.remaining());
     int bytesRead = sdkChannel.read(dst);
     if (bytesRead >= 0) {
+      extractMetadataAfterRead(sdkChannel);
       gcsReadChannelPosition += bytesRead;
       strategy.position(gcsReadChannelPosition);
       return bytesRead;
     }
-    if (strategy.isEof(gcsReadChannelPosition)) {
+    extractMetadataAfterRead(sdkChannel);
+    if (itemInfo == null && itemInfoProvider != null) {
+      try {
+        GcsItemInfo resolved = itemInfoProvider.getItemInfo(itemId);
+        if (resolved != null && resolved.exists()) {
+          updateItemInfo(resolved);
+        }
+      } catch (Exception ignored) {
+        // Fall back to strategy.isEof check
+      }
+    }
+    if (dst.remaining() == 0 || strategy.isEof(gcsReadChannelPosition)) {
       return -1;
     }
     throw createUnexpectedEofException();
@@ -204,15 +220,34 @@ class GcsReadChannel implements VectoredSeekableByteChannel {
 
   @Override
   public long size() throws IOException {
-    if (itemInfo != null || extractMetadataAfterRead(this.strategy)) {
+    checkChannelOpen();
+    if (itemInfo == null) {
+      try {
+        read(ByteBuffer.allocate(0));
+      } catch (Exception e) {
+        if (itemInfoProvider == null) {
+          throw e instanceof IOException ? (IOException) e : new IOException(e);
+        }
+      }
+    }
+    if (itemInfo != null) {
+      if (!itemInfo.exists()) {
+        throw new FileNotFoundException("Item not found: " + itemId);
+      }
       return itemInfo.getSize();
     }
     if (itemInfoProvider == null) {
       throw new IOException("ItemInfo is not initialized and no ItemInfoProvider was provided.");
     }
 
-    itemInfo = itemInfoProvider.getItemInfo(itemId);
-    itemId = itemInfo.getItemId();
+    GcsItemInfo resolved = itemInfoProvider.getItemInfo(itemId);
+    if (resolved == null) {
+      throw new IOException("ItemInfo is not initialized and no ItemInfoProvider was provided.");
+    }
+    if (!resolved.exists()) {
+      throw new FileNotFoundException("Item not found: " + itemId);
+    }
+    updateItemInfo(resolved);
     return itemInfo.getSize();
   }
 
@@ -293,7 +328,7 @@ class GcsReadChannel implements VectoredSeekableByteChannel {
             int numOfBytesRead = 0;
             while (dataBuffer.hasRemaining()) {
               int bytesRead = channel.read(dataBuffer);
-              extractMetadataAfterRead(readStrategy);
+              extractMetadataAfterRead(channel);
               if (bytesRead < 0) {
                 // EOF reached.
                 break;
@@ -369,7 +404,7 @@ class GcsReadChannel implements VectoredSeekableByteChannel {
     }
   }
 
-  private boolean extractMetadataAfterRead(ReadStrategy strategy) {
+  private boolean extractMetadataAfterRead(@Nullable ReadChannel target) {
     if (itemInfo != null || metadataExtractionAttempted) {
       return itemInfo != null;
     }
@@ -377,13 +412,26 @@ class GcsReadChannel implements VectoredSeekableByteChannel {
       if (itemInfo != null || metadataExtractionAttempted) {
         return itemInfo != null;
       }
-      ExtractedMetadata metadata =
-          GcsReadChannelMetadataExtractor.extract(strategy.getSdkReadChannel());
+      if (target == null) {
+        return false;
+      }
+
+      ExtractedMetadata metadata = GcsReadChannelMetadataExtractor.extract(target);
       if (metadata != null) {
         updateGcsItemMetadata(metadata);
       }
       metadataExtractionAttempted = true;
       return metadata != null;
+    }
+  }
+
+  private void updateItemInfo(GcsItemInfo newItemInfo) {
+    this.itemInfo = newItemInfo;
+    if (newItemInfo != null && newItemInfo.getItemId() != null) {
+      this.itemId = newItemInfo.getItemId();
+    }
+    if (strategy instanceof AbstractReadStrategy) {
+      ((AbstractReadStrategy) strategy).updateItemInfo(this.itemInfo);
     }
   }
 
@@ -403,7 +451,8 @@ class GcsReadChannel implements VectoredSeekableByteChannel {
       itemInfoBuilder.setContentGeneration(genToSet);
     }
 
-    itemId = itemIdBuilder.build();
-    itemInfo = itemInfoBuilder.setItemId(itemId).build();
+    GcsItemId newItemId = itemIdBuilder.build();
+    GcsItemInfo newItemInfo = itemInfoBuilder.setItemId(newItemId).build();
+    updateItemInfo(newItemInfo);
   }
 }

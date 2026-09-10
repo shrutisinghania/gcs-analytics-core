@@ -219,4 +219,25 @@ class SequentialReadStrategyTest {
     assertThat(strategy.channel).isNotNull();
     assertThat(strategy.channel).isNotEqualTo(oldChannel);
   }
+
+  @Test
+  void updateItemInfo_updatesItemInfoAndItemId() throws IOException {
+    StorageTestUtils.createBlobInStorage(storage, itemId, "a".repeat(1000));
+    SequentialReadStrategy strategy =
+        new SequentialReadStrategy(storage, itemId, options, itemInfo);
+    GcsItemId newItemId =
+        GcsItemId.builder()
+            .setBucketName(itemId.getBucketName())
+            .setObjectName(itemId.getObjectName().get())
+            .setContentGeneration(5L)
+            .build();
+    GcsItemInfo newItemInfo =
+        GcsItemInfo.builder().setItemId(newItemId).setSize(2000).setContentGeneration(5L).build();
+
+    strategy.updateItemInfo(newItemInfo);
+
+    assertThat(strategy.itemInfo).isEqualTo(newItemInfo);
+    assertThat(strategy.itemId).isEqualTo(newItemId);
+    assertThat(strategy.itemId.getContentGeneration()).hasValue(5L);
+  }
 }

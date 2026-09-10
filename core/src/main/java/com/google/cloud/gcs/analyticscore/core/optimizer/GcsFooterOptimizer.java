@@ -21,11 +21,13 @@ import static com.google.common.base.Preconditions.checkNotNull;
 import com.google.cloud.gcs.analyticscore.client.AnalyticsCacheManager;
 import com.google.cloud.gcs.analyticscore.client.GcsFileInfo;
 import com.google.cloud.gcs.analyticscore.client.GcsItemId;
+import com.google.cloud.gcs.analyticscore.client.GcsItemInfo;
 import com.google.cloud.gcs.analyticscore.client.GcsReadOptions;
 import com.google.cloud.gcs.analyticscore.client.VectoredSeekableByteChannel;
 import com.google.cloud.gcs.analyticscore.common.GcsAnalyticsCoreTelemetryConstants.Metric;
 import com.google.cloud.gcs.analyticscore.common.telemetry.Telemetry;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.util.Collections;
 import java.util.Set;
@@ -41,10 +43,11 @@ public class GcsFooterOptimizer implements FormatOptimizer {
   private final Telemetry telemetry;
 
   private AnalyticsCacheManager cacheManager;
-  private GcsItemId gcsItemId;
-  private long fileSize = -1;
-  private long prefetchSize = -1;
-  private ByteBuffer localFooterBuffer;
+  private volatile GcsItemId gcsItemId;
+  private volatile long fileSize = -1;
+  private volatile long prefetchSize = -1;
+  private volatile ByteBuffer localFooterBuffer;
+  private volatile boolean sizeResolutionAttempted = false;
 
   public GcsFooterOptimizer(GcsReadOptions readOptions, Telemetry telemetry) {
     this.readOptions = checkNotNull(readOptions, "readOptions cannot be null");
@@ -67,25 +70,54 @@ public class GcsFooterOptimizer implements FormatOptimizer {
   public void onOpen(GcsItemId itemId, AnalyticsCacheManager cacheManager) {
     this.gcsItemId = itemId;
     this.cacheManager = cacheManager;
+    this.fileSize = -1;
+    this.prefetchSize = -1;
+    this.sizeResolutionAttempted = false;
+    this.localFooterBuffer = null;
   }
 
   @Override
   public void onOpen(GcsFileInfo fileInfo, AnalyticsCacheManager cacheManager) {
     this.gcsItemId = fileInfo.getItemInfo().getItemId();
     this.cacheManager = cacheManager;
-    this.fileSize = fileInfo.getItemInfo().getSize();
+    this.sizeResolutionAttempted = true;
+    this.localFooterBuffer = null;
+    initFooterBounds(fileInfo.getItemInfo().getSize());
+  }
+
+  private void initFooterBounds(long fileSize) {
+    this.fileSize = fileSize;
     this.prefetchSize = calculatePrefetchSize(fileSize, readOptions);
+  }
+
+  private void tryResolveFileSize(VectoredSeekableByteChannel source) throws IOException {
+    if (fileSize != -1) {
+      return;
+    }
+    GcsItemInfo info = source.getItemInfo();
+    if (info == null && !sizeResolutionAttempted) {
+      sizeResolutionAttempted = true;
+      source.read(ByteBuffer.allocate(0));
+      info = source.getItemInfo();
+    }
+    if (info != null && info.getSize() >= 0) {
+      if (info.getItemId() != null) {
+        this.gcsItemId = info.getItemId();
+      }
+      initFooterBounds(info.getSize());
+    }
   }
 
   @Override
   public int read(long position, ByteBuffer dst, VectoredSeekableByteChannel source)
       throws IOException {
-    if (fileSize == -1) {
-      fileSize = source.size();
-      prefetchSize = calculatePrefetchSize(fileSize, readOptions);
+    tryResolveFileSize(source);
+
+    if (fileSize == -1 || prefetchSize <= 0 || position < (fileSize - prefetchSize)) {
+      return 0;
     }
 
-    if (prefetchSize <= 0 || position < (fileSize - prefetchSize)) {
+    if (dst.remaining() == 0) {
       return 0;
     }
 
@@ -94,26 +126,39 @@ public class GcsFooterOptimizer implements FormatOptimizer {
     }
 
     if (localFooterBuffer == null) {
-      // AtomicBoolean serves as a mutable wrapper to signal intent clearly
       AtomicBoolean isMiss = new AtomicBoolean(false);
-      localFooterBuffer =
-          cacheManager.getFooter(
-              gcsItemId,
-              itemId -> {
-                isMiss.set(true);
-                return loadFooter(source);
-              });
+      try {
+        localFooterBuffer =
+            cacheManager.getFooter(
+                gcsItemId,
+                itemId -> {
+                  isMiss.set(true);
+                  return loadFooter(source);
+                });
+      } catch (UncheckedIOException e) {
+        if (e.getCause() != null) {
+          throw e.getCause();
+        }
+        throw new IOException(e);
+      }
+
+      if (localFooterBuffer == null) {
+        return 0;
+      }
 
       if (!isMiss.get()) {
         telemetry.recordMetric(Metric.FOOTER_CACHE_HIT, 1L, Collections.emptyMap());
       }
     } else {
-      // If we already fetched it locally for this stream, it's a guaranteed hit
       telemetry.recordMetric(Metric.FOOTER_PREFETCH_HIT, 1L, Collections.emptyMap());
     }
 
-    ByteBuffer footerView = localFooterBuffer.duplicate();
     int readStartPosition = (int) (position - (fileSize - prefetchSize));
+    if (readStartPosition < 0 || readStartPosition >= localFooterBuffer.limit()) {
+      return 0;
+    }
+
+    ByteBuffer footerView = localFooterBuffer.duplicate();
     footerView.position(readStartPosition);
 
     int bytesToRead = Math.min(dst.remaining(), footerView.remaining());
@@ -131,8 +176,13 @@ public class GcsFooterOptimizer implements FormatOptimizer {
     try {
       source.position(startPosition);
       while (cacheBuffer.hasRemaining()) {
-        if (source.read(cacheBuffer) == -1) {
+        int read = source.read(cacheBuffer);
+        if (read == -1) {
           throw new IOException("Unexpected EOF encountered while reading footer.");
+        }
+        if (read == 0) {
+          throw new IOException(
+              "Zero bytes read while attempting to load footer for item: " + gcsItemId);
         }
       }
       cacheBuffer.flip();

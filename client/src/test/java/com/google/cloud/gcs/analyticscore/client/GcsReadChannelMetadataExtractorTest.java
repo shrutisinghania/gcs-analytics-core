@@ -45,6 +45,27 @@ class GcsReadChannelMetadataExtractorTest {
   }
 
   @Test
+  void extract_wrappedChannelWithReaderField_returnsMetadata() {
+    BlobInfo blobInfo = Mockito.mock(BlobInfo.class);
+    Mockito.when(blobInfo.getSize()).thenReturn(888L);
+    Mockito.when(blobInfo.getGeneration()).thenReturn(999L);
+    ReflectiveBlobInfoChannel innerChannel = Mockito.mock(ReflectiveBlobInfoChannel.class);
+    Mockito.when(innerChannel.getBlobInfo()).thenReturn(blobInfo);
+
+    Object wrappedChannel =
+        new Object() {
+          private final ReadChannel reader = innerChannel;
+        };
+
+    GcsReadChannelMetadataExtractor.ExtractedMetadata metadata =
+        GcsReadChannelMetadataExtractor.extract(wrappedChannel);
+
+    assertThat(metadata).isNotNull();
+    assertThat(metadata.getSize()).isEqualTo(888L);
+    assertThat(metadata.getGeneration()).isEqualTo(999L);
+  }
+
+  @Test
   void extract_unsupportedChannelClass_returnsNull() {
     ReadChannel channel = Mockito.mock(ReadChannel.class);
 
@@ -322,6 +343,86 @@ class GcsReadChannelMetadataExtractorTest {
     assertThat(metadata).isNotNull();
     assertThat(metadata.getSize()).isEqualTo(900L);
     assertThat(metadata.getGeneration()).isEqualTo(1000L);
+  }
+
+  @Test
+  void extract_emptyPrototypeStorageObject_fallsThroughToResultFuture() {
+    // Simulates BlobReadChannelV2: field storageObject has no size, superclass has result future
+    Object emptyStorageObject = new Object(); // no getSize or getGeneration
+    BlobInfo resolvedBlobInfo = Mockito.mock(BlobInfo.class);
+    Mockito.when(resolvedBlobInfo.getSize()).thenReturn(123456L);
+    Mockito.when(resolvedBlobInfo.getGeneration()).thenReturn(789L);
+    CompletableFuture<BlobInfo> resultFuture = CompletableFuture.completedFuture(resolvedBlobInfo);
+
+    Object fakeBlobReadChannelV2 =
+        new Object() {
+          private final Object storageObject = emptyStorageObject;
+          private final Future<BlobInfo> result = resultFuture;
+        };
+
+    GcsReadChannelMetadataExtractor.ExtractedMetadata metadata =
+        GcsReadChannelMetadataExtractor.extract(fakeBlobReadChannelV2);
+
+    assertThat(metadata).isNotNull();
+    assertThat(metadata.getSize()).isEqualTo(123456L);
+    assertThat(metadata.getGeneration()).isEqualTo(789L);
+  }
+
+  @Test
+  void extract_validGenerationButNegativeSize_returnsNull() {
+    Object objectWithGenOnly =
+        new Object() {
+          public long getGeneration() {
+            return 555L;
+          }
+        };
+    Object channel =
+        new Object() {
+          private final Object object = objectWithGenOnly;
+        };
+
+    GcsReadChannelMetadataExtractor.ExtractedMetadata metadata =
+        GcsReadChannelMetadataExtractor.extract(channel);
+
+    assertThat(metadata).isNull();
+  }
+
+  @Test
+  void extract_objectWithGenerationOnlySkipped_findsCompleteMetadataInAnotherField() {
+    Object objectWithGenOnly =
+        new Object() {
+          public long getGeneration() {
+            return 555L;
+          }
+        };
+    BlobInfo completeBlobInfo = Mockito.mock(BlobInfo.class);
+    Mockito.when(completeBlobInfo.getSize()).thenReturn(4096L);
+    Mockito.when(completeBlobInfo.getGeneration()).thenReturn(777L);
+
+    Object channel =
+        new Object() {
+          private final Object storageObject = objectWithGenOnly;
+          private final Object result = completeBlobInfo;
+        };
+
+    GcsReadChannelMetadataExtractor.ExtractedMetadata metadata =
+        GcsReadChannelMetadataExtractor.extract(channel);
+
+    assertThat(metadata).isNotNull();
+    assertThat(metadata.getSize()).isEqualTo(4096L);
+    assertThat(metadata.getGeneration()).isEqualTo(777L);
+  }
+
+  @Test
+  void extract_circularWrapperReference_terminatesWithoutOverflow() {
+    class CircularChannel {
+      private final Object reader = this;
+    }
+
+    GcsReadChannelMetadataExtractor.ExtractedMetadata metadata =
+        GcsReadChannelMetadataExtractor.extract(new CircularChannel());
+
+    assertThat(metadata).isNull();
   }
 
   static class ThrowingModel {

@@ -22,6 +22,8 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -579,5 +581,103 @@ class GoogleCloudStorageInputStreamTest {
 
       assertThat(buffer[i]).isEqualTo(testData[100 + i]);
     }
+  }
+
+  @Test
+  void readTail_uninitializedFileInfo_usesByteChannelSizeAndNeverCallsGetFileInfo()
+      throws IOException {
+    VectoredSeekableByteChannel mockChannel = mock(VectoredSeekableByteChannel.class);
+    when(mockChannel.size()).thenReturn(100L);
+    when(mockChannel.read(any(ByteBuffer.class)))
+        .thenAnswer(
+            inv -> {
+              ByteBuffer dst = inv.getArgument(0);
+              int len = dst.remaining();
+              dst.put(new byte[len]);
+              return len;
+            });
+
+    GcsFileSystem mockFileSystem = mock(GcsFileSystem.class);
+    when(mockFileSystem.getFileSystemOptions()).thenReturn(fileSystemOptions);
+    when(mockFileSystem.getTelemetry()).thenReturn(new Telemetry(ImmutableList.of()));
+    when(mockFileSystem.getCacheManager()).thenReturn(fakeFileSystem.getCacheManager());
+    when(mockFileSystem.open(any(GcsItemId.class), any())).thenReturn(mockChannel);
+
+    googleCloudStorageInputStream =
+        GoogleCloudStorageInputStream.create(mockFileSystem, testGcsItemId);
+
+    byte[] buffer = new byte[10];
+    int bytesRead = googleCloudStorageInputStream.readTail(buffer, 0, 10);
+
+    assertThat(bytesRead).isEqualTo(10);
+    verify(mockChannel).size();
+    verify(mockFileSystem, never()).getFileInfo(any(GcsItemId.class));
+  }
+
+  @Test
+  void readTail_uninitializedFileInfo_populatesAndCachesFileInfoFromChannel() throws IOException {
+    GcsItemInfo itemInfo = GcsItemInfo.builder().setItemId(testGcsItemId).setSize(100L).build();
+    VectoredSeekableByteChannel mockChannel = mock(VectoredSeekableByteChannel.class);
+    when(mockChannel.size()).thenReturn(100L);
+    when(mockChannel.getItemInfo()).thenReturn(itemInfo);
+    when(mockChannel.read(any(ByteBuffer.class)))
+        .thenAnswer(
+            inv -> {
+              ByteBuffer dst = inv.getArgument(0);
+              int len = dst.remaining();
+              dst.put(new byte[len]);
+              return len;
+            });
+
+    GcsFileSystem mockFileSystem = mock(GcsFileSystem.class);
+    when(mockFileSystem.getFileSystemOptions()).thenReturn(fileSystemOptions);
+    when(mockFileSystem.getTelemetry()).thenReturn(new Telemetry(ImmutableList.of()));
+    when(mockFileSystem.getCacheManager()).thenReturn(fakeFileSystem.getCacheManager());
+    when(mockFileSystem.open(any(GcsItemId.class), any())).thenReturn(mockChannel);
+    when(mockFileSystem.open(any(GcsFileInfo.class), any())).thenReturn(mockChannel);
+
+    googleCloudStorageInputStream =
+        GoogleCloudStorageInputStream.create(mockFileSystem, testGcsItemId);
+
+    byte[] buffer = new byte[10];
+    googleCloudStorageInputStream.readTail(buffer, 0, 10);
+    // Second call to readTail should pass the cached GcsFileInfo to mockFileSystem.open
+    googleCloudStorageInputStream.readTail(buffer, 0, 10);
+
+    verify(mockFileSystem, times(2)).open(any(GcsItemId.class), any());
+    verify(mockFileSystem, times(1)).open(any(GcsFileInfo.class), any());
+  }
+
+  @Test
+  void readTail_channelItemInfoNotExists_doesNotCacheFileInfo() throws IOException {
+    GcsItemInfo itemInfo = GcsItemInfo.createNotFound(testGcsItemId);
+    VectoredSeekableByteChannel mockChannel = mock(VectoredSeekableByteChannel.class);
+    when(mockChannel.size()).thenReturn(100L);
+    when(mockChannel.getItemInfo()).thenReturn(itemInfo);
+    when(mockChannel.read(any(ByteBuffer.class)))
+        .thenAnswer(
+            inv -> {
+              ByteBuffer dst = inv.getArgument(0);
+              int len = dst.remaining();
+              dst.put(new byte[len]);
+              return len;
+            });
+
+    GcsFileSystem mockFileSystem = mock(GcsFileSystem.class);
+    when(mockFileSystem.getFileSystemOptions()).thenReturn(fileSystemOptions);
+    when(mockFileSystem.getTelemetry()).thenReturn(new Telemetry(ImmutableList.of()));
+    when(mockFileSystem.getCacheManager()).thenReturn(fakeFileSystem.getCacheManager());
+    when(mockFileSystem.open(any(GcsItemId.class), any())).thenReturn(mockChannel);
+
+    googleCloudStorageInputStream =
+        GoogleCloudStorageInputStream.create(mockFileSystem, testGcsItemId);
+
+    byte[] buffer = new byte[10];
+    googleCloudStorageInputStream.readTail(buffer, 0, 10);
+    // Second call to readTail should NOT pass cached GcsFileInfo because exists() is false
+    googleCloudStorageInputStream.readTail(buffer, 0, 10);
+
+    verify(mockFileSystem, times(3)).open(any(GcsItemId.class), any());
+    verify(mockFileSystem, never()).open(any(GcsFileInfo.class), any());
   }
 }

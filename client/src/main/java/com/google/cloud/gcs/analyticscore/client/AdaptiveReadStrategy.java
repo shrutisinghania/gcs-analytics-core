@@ -21,7 +21,7 @@ import java.io.IOException;
 import javax.annotation.Nullable;
 
 class AdaptiveReadStrategy extends AbstractReadStrategy {
-  private ReadStrategy currentStrategy;
+  private volatile ReadStrategy currentStrategy;
   private boolean isRandomMode = false;
   private int sequentialReadCount = 0;
   private long lastReadEndPosition = 0;
@@ -70,6 +70,15 @@ class AdaptiveReadStrategy extends AbstractReadStrategy {
   @Override
   public long getLimit() {
     return currentStrategy.getLimit();
+  }
+
+  @Override
+  void updateItemInfo(GcsItemInfo itemInfo) {
+    super.updateItemInfo(itemInfo);
+    ReadStrategy delegate = currentStrategy;
+    if (delegate instanceof AbstractReadStrategy) {
+      ((AbstractReadStrategy) delegate).updateItemInfo(itemInfo);
+    }
   }
 
   ReadStrategy getDelegateStrategy() {

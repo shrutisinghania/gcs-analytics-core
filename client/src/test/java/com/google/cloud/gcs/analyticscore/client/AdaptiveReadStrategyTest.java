@@ -298,6 +298,31 @@ class AdaptiveReadStrategyTest {
     assertThat(strategy.getLimit()).isEqualTo(Long.MAX_VALUE);
   }
 
+  @Test
+  void updateItemInfo_updatesItemInfoOnSelfAndDelegateStrategy() throws IOException {
+    AdaptiveReadStrategy strategy = new AdaptiveReadStrategy(storage, itemId, options, itemInfo);
+    GcsItemId newItemId =
+        GcsItemId.builder()
+            .setBucketName(itemId.getBucketName())
+            .setObjectName(itemId.getObjectName().get())
+            .setContentGeneration(5L)
+            .build();
+    GcsItemInfo newItemInfo =
+        GcsItemInfo.builder().setItemId(newItemId).setSize(2000).setContentGeneration(5L).build();
+
+    strategy.updateItemInfo(newItemInfo);
+
+    assertThat(strategy.itemInfo).isEqualTo(newItemInfo);
+    assertThat(strategy.itemId).isEqualTo(newItemId);
+    assertThat(strategy.itemId.getContentGeneration()).hasValue(5L);
+    assertThat(((AbstractReadStrategy) strategy.getDelegateStrategy()).itemInfo)
+        .isEqualTo(newItemInfo);
+    assertThat(((AbstractReadStrategy) strategy.getDelegateStrategy()).itemId).isEqualTo(newItemId);
+    assertThat(
+            ((AbstractReadStrategy) strategy.getDelegateStrategy()).itemId.getContentGeneration())
+        .hasValue(5L);
+  }
+
   private void createBlobInStorage(String content) {
     StorageTestUtils.createBlobInStorage(storage, itemId, content);
   }
