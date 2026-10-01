@@ -107,19 +107,17 @@ public class GcsFooterOptimizer implements FormatOptimizer {
       resolveFileSizeExplicitly(source);
     }
 
-    // Checked before the footer-range guard: a window prefetched while the size was unknown may
-    // legitimately start before 'fileSize - prefetchSize'.
-    if (bufferCovers(position)) {
-      telemetry.recordMetric(Metric.FOOTER_PREFETCH_HIT, 1L, Collections.emptyMap());
-      return serveFromBuffer(position, dst);
-    }
-
     if (prefetchSize <= 0 || position < fileSize - prefetchSize) {
       return 0;
     }
 
     if (position >= fileSize) {
       return -1;
+    }
+
+    if (bufferCovers(position)) {
+      telemetry.recordMetric(Metric.FOOTER_PREFETCH_HIT, 1L, Collections.emptyMap());
+      return serveFromBuffer(position, dst);
     }
 
     AtomicBoolean isMiss = new AtomicBoolean(false);
@@ -130,7 +128,7 @@ public class GcsFooterOptimizer implements FormatOptimizer {
               isMiss.set(true);
               return loadFooter(source);
             });
-    adoptBuffer(footer, fileSize - footer.limit());
+    adoptFooterBuffer(footer);
 
     if (!isMiss.get()) {
       telemetry.recordMetric(Metric.FOOTER_CACHE_HIT, 1L, Collections.emptyMap());
@@ -139,19 +137,19 @@ public class GcsFooterOptimizer implements FormatOptimizer {
     return serveFromBuffer(position, dst);
   }
 
+  private void adoptFooterBuffer(ByteBuffer footer) {
+    localFooterBuffer = footer;
+    localBufferStartPosition = fileSize - footer.limit();
+  }
+
   /**
    * Serves a read issued before the object size is known.
    *
-   * <p>Columnar readers open a file by reading its tail (footer length, magic, postscript), so the
-   * first read is assumed to be close to the end of the object. A single window ending at the
-   * requested range and extending {@link #estimatePrefetchSize()} bytes before it is fetched. That
-   * one request both (a) makes the SDK channel expose the object metadata, which {@link
-   * #resolveFileSizeFromItemInfo} then picks up without any additional metadata call, and (b) in
-   * the common case already contains the footer, which is published to the cache.
-   *
-   * <p>If the guess is wrong (the window does not reach the end of the object), the bytes are still
-   * kept for this stream so that nothing fetched is wasted, and the optimizer behaves like a normal
-   * footer cache from then on. At most one such speculative read is ever issued per stream.
+   * <p>Columnar readers open a file by reading near its tail (e.g. Parquet calls {@code
+   * readIntLittleEndian} at {@code fileSize - 8}, issuing a 1-byte read first). Reading up to
+   * {@code estimatedPrefetchSize * 2} bytes from {@code position - estimatedPrefetchSize} reaches
+   * the end of the object in a single request, which both exposes the object metadata on the SDK
+   * channel and allows the canonical footer to be cached immediately.
    */
   private int readWithUnknownFileSize(
       long position, ByteBuffer dst, VectoredSeekableByteChannel source) throws IOException {
@@ -168,19 +166,15 @@ public class GcsFooterOptimizer implements FormatOptimizer {
     // Set before issuing the request so that a failed or empty attempt is never repeated.
     speculativeReadAttempted = true;
     long startPosition = Math.max(0, position - estimatedPrefetchSize);
-    long windowSize = position - startPosition + dst.remaining();
-    ByteBuffer window = readWindow(startPosition, windowSize, source);
+    ByteBuffer prefetchedBuffer = readToEndOfObject(startPosition, estimatedPrefetchSize, source);
     resolveFileSizeFromItemInfo(source);
-    if (window == null) {
+    if (prefetchedBuffer == null) {
       return 0;
     }
 
-    ByteBuffer canonicalFooter = toCanonicalFooter(startPosition, window);
+    ByteBuffer canonicalFooter = toCanonicalFooter(startPosition, prefetchedBuffer);
     if (canonicalFooter == null) {
-      // Either not the tail of the object or the size is still unknown: keep the window for this
-      // stream only.
-      adoptBuffer(window, startPosition);
-      return serveFromBuffer(position, dst);
+      return copyOut(prefetchedBuffer, startPosition, position, dst);
     }
 
     AtomicBoolean isMiss = new AtomicBoolean(false);
@@ -192,7 +186,7 @@ public class GcsFooterOptimizer implements FormatOptimizer {
               telemetry.recordMetric(Metric.FOOTER_CACHE_MISS, 1L, Collections.emptyMap());
               return canonicalFooter;
             });
-    adoptBuffer(footer, fileSize - footer.limit());
+    adoptFooterBuffer(footer);
 
     if (!isMiss.get()) {
       telemetry.recordMetric(Metric.FOOTER_CACHE_HIT, 1L, Collections.emptyMap());
@@ -201,26 +195,37 @@ public class GcsFooterOptimizer implements FormatOptimizer {
     return serveFromBuffer(position, dst);
   }
 
-  private void adoptBuffer(ByteBuffer buffer, long startPosition) {
-    localFooterBuffer = buffer;
-    localBufferStartPosition = startPosition;
+  private static int copyOut(
+      ByteBuffer buffer, long bufferStartPosition, long position, ByteBuffer dst) {
+    long offset = position - bufferStartPosition;
+    if (offset < 0 || offset >= buffer.limit()) {
+      return 0;
+    }
+    ByteBuffer view = buffer.duplicate();
+    view.position(Math.toIntExact(offset));
+
+    int bytesToRead = Math.min(dst.remaining(), view.remaining());
+    view.limit(view.position() + bytesToRead);
+    dst.put(view);
+
+    return bytesToRead;
   }
 
   /**
    * Returns a copy of the canonical footer range {@code [fileSize - prefetchSize, fileSize)} taken
-   * from {@code window}, or {@code null} if the size is unknown or the window does not cover it.
+   * from {@code buffer}, or {@code null} if the size is unknown or the buffer does not cover it.
    */
   @Nullable
-  private ByteBuffer toCanonicalFooter(long startPosition, ByteBuffer window) {
+  private ByteBuffer toCanonicalFooter(long startPosition, ByteBuffer buffer) {
     if (fileSize == -1 || prefetchSize <= 0) {
       return null;
     }
     long canonicalStartPosition = fileSize - prefetchSize;
-    if (startPosition > canonicalStartPosition || startPosition + window.limit() != fileSize) {
+    if (startPosition > canonicalStartPosition || startPosition + buffer.limit() != fileSize) {
       return null;
     }
 
-    ByteBuffer footerView = window.duplicate();
+    ByteBuffer footerView = buffer.duplicate();
     footerView.position(Math.toIntExact(canonicalStartPosition - startPosition));
     ByteBuffer canonicalFooter = ByteBuffer.allocate(Math.toIntExact(prefetchSize));
     canonicalFooter.put(footerView);
@@ -229,28 +234,25 @@ public class GcsFooterOptimizer implements FormatOptimizer {
     return canonicalFooter;
   }
 
-  /**
-   * Reads up to {@code windowSize} bytes starting at {@code startPosition}, stopping early at the
-   * end of the object. Returns {@code null} if nothing could be read.
-   */
   @Nullable
-  private ByteBuffer readWindow(
-      long startPosition, long windowSize, VectoredSeekableByteChannel source) throws IOException {
-    ByteBuffer window = ByteBuffer.allocate(Math.toIntExact(windowSize));
+  private ByteBuffer readToEndOfObject(
+      long startPosition, long estimatedPrefetchSize, VectoredSeekableByteChannel source)
+      throws IOException {
+    ByteBuffer buffer = ByteBuffer.allocate(Math.toIntExact(estimatedPrefetchSize * 2));
     long originalPosition = source.position();
     try {
       source.position(startPosition);
-      while (window.hasRemaining()) {
-        if (source.read(window) <= 0) {
+      while (buffer.hasRemaining()) {
+        if (source.read(buffer) <= 0) {
           break;
         }
       }
     } finally {
       source.position(originalPosition);
     }
-    window.flip();
+    buffer.flip();
 
-    return window.limit() == 0 ? null : window;
+    return buffer.limit() == 0 ? null : buffer;
   }
 
   /**

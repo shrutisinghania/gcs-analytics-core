@@ -469,10 +469,11 @@ class GcsFooterOptimizerTest {
                 invocation.getArgument(1, AnalyticsCacheManager.FooterLoader.class).load(ITEM_ID));
     AtomicInteger dataReadCount = new AtomicInteger(0);
     VectoredSeekableByteChannel mockSource = fakeChannel(largeData, dataReadCount, largeItemInfo);
-    // Speculating around 4450 reads [3950, 4458): it stops before the footer, which starts at 4900.
+    // Speculating around 4450 reads [3950, 4950): it overlaps the footer (which starts at 4900)
+    // without covering all of it.
     int unused = optimizer.read(4450, ByteBuffer.allocate(8), mockSource);
 
-    // A footer read outside that window must be served in full from the canonical footer.
+    // A footer read that extends past 4950 must not be served as a short 50-byte read.
     ByteBuffer dst = ByteBuffer.allocate(100);
     int bytesRead = optimizer.read(4900, dst, mockSource);
 
