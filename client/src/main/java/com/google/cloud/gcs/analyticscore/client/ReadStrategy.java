@@ -35,6 +35,15 @@ interface ReadStrategy {
   ReadChannel getSdkReadChannel();
 
   /**
+   * Notifies the strategy that the object's metadata has been resolved (typically extracted from
+   * the SDK channel after the first read). Implementations should use it to bound EOF checks and to
+   * pin the content generation for any SDK channel opened afterwards.
+   *
+   * @param itemInfo the resolved metadata; its size must be non-negative.
+   */
+  default void updateItemInfo(GcsItemInfo itemInfo) {}
+
+  /**
    * Updates the strategy's current read position.
    *
    * @param newPosition the new read position

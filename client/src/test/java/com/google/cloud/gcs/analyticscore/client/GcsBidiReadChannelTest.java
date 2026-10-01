@@ -342,11 +342,11 @@ class GcsBidiReadChannelTest {
   }
 
   @Test
-  void testDummyReadStrategy_getSdkReadChannel_throwsUnsupported() {
+  void testDummyReadStrategy_getSdkReadChannel_returnsNull() {
     ReadStrategy strategy =
         reader.createReadStrategy(storage, itemId, GcsReadOptions.builder().build(), null);
 
-    assertThrows(UnsupportedOperationException.class, strategy::getSdkReadChannel);
+    assertThat(strategy.getSdkReadChannel()).isNull();
   }
 
   @Test
@@ -642,6 +642,45 @@ class GcsBidiReadChannelTest {
     assertThat(firstCall).isEqualTo(150L);
     assertThat(secondCall).isEqualTo(150L);
     verify(blobReadSession, times(1)).getBlobInfo();
+  }
+
+  @Test
+  void size_sessionBlobInfoWithoutGeneration_keepsPinnedGeneration() throws Exception {
+    GcsItemId pinnedItemId =
+        GcsItemId.builder()
+            .setBucketName(itemId.getBucketName())
+            .setObjectName(itemId.getObjectName().get())
+            .setContentGeneration(123L)
+            .build();
+    GcsItemInfo itemInfo = GcsItemInfo.builder().setItemId(pinnedItemId).setSize(-1L).build();
+    GcsReadOptions readOptions = GcsReadOptions.builder().setBidiTimeout(10).build();
+    GcsBidiReadChannel seekableReader =
+        new GcsBidiReadChannel(storage, itemInfo, readOptions, executorServiceSupplier, telemetry);
+    BlobInfo mockBlobInfo = mock(BlobInfo.class);
+    when(mockBlobInfo.getSize()).thenReturn(150L);
+    when(mockBlobInfo.getGeneration()).thenReturn(null);
+    when(blobReadSession.getBlobInfo()).thenReturn(mockBlobInfo);
+
+    long unused = seekableReader.size();
+
+    // Losing the pin would let the channels opened from the published item id resolve to whatever
+    // the live version of the object is.
+    assertThat(seekableReader.getItemInfo().getItemId().getContentGeneration()).hasValue(123L);
+  }
+
+  @Test
+  void size_sessionBlobInfoWithoutSize_fallsBackToSuperSize() throws Exception {
+    GcsItemInfo itemInfo = GcsItemInfo.builder().setItemId(itemId).setSize(100L).build();
+    GcsReadOptions readOptions = GcsReadOptions.builder().setBidiTimeout(10).build();
+    GcsBidiReadChannel seekableReader =
+        new GcsBidiReadChannel(storage, itemInfo, readOptions, executorServiceSupplier, telemetry);
+    BlobInfo mockBlobInfo = mock(BlobInfo.class);
+    when(mockBlobInfo.getSize()).thenReturn(null);
+    when(blobReadSession.getBlobInfo()).thenReturn(mockBlobInfo);
+
+    long resultSize = seekableReader.size();
+
+    assertThat(resultSize).isEqualTo(100L);
   }
 
   @Test

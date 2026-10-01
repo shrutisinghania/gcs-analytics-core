@@ -127,6 +127,31 @@ class GoogleCloudStorageInputStreamTest {
   }
 
   @Test
+  void size_withGcsFileInfo_returnsSizeFromFileInfo() throws IOException {
+    GcsFileInfo fileInfo = fakeFileSystem.getFileInfo(testUri);
+    googleCloudStorageInputStream = GoogleCloudStorageInputStream.create(fakeFileSystem, fileInfo);
+
+    assertThat(googleCloudStorageInputStream.size()).isEqualTo(fileSize);
+  }
+
+  @Test
+  void size_withGcsItemId_resolvesSizeFromChannel() throws IOException {
+    googleCloudStorageInputStream =
+        GoogleCloudStorageInputStream.create(fakeFileSystem, testGcsItemId);
+
+    assertThat(googleCloudStorageInputStream.size()).isEqualTo(fileSize);
+  }
+
+  @Test
+  void size_afterClose_throwsIOException() throws IOException {
+    googleCloudStorageInputStream =
+        GoogleCloudStorageInputStream.create(fakeFileSystem, testGcsItemId);
+    googleCloudStorageInputStream.close();
+
+    assertThrows(IOException.class, () -> googleCloudStorageInputStream.size());
+  }
+
+  @Test
   void create_withGcsItemId_nullFileSystem_throwsIllegalStateException() {
     var exception =
         assertThrows(

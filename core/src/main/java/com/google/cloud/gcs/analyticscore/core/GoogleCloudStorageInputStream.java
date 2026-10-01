@@ -44,12 +44,12 @@ public class GoogleCloudStorageInputStream extends SeekableInputStream {
   private final VectoredSeekableByteChannel channel;
   private long position;
   private final URI gcsPath;
-  private GcsItemId gcsItemId;
+  private volatile GcsItemId gcsItemId;
   private final ImmutableMap<String, String> commonAttributes;
 
   private volatile boolean closed;
 
-  private GcsFileInfo gcsFileInfo;
+  private volatile GcsFileInfo gcsFileInfo;
 
   public static GoogleCloudStorageInputStream create(
       GcsFileSystem gcsFileSystem, GcsFileInfo gcsFileInfo) throws IOException {
@@ -93,6 +93,45 @@ public class GoogleCloudStorageInputStream extends SeekableInputStream {
   @Override
   public long getPos() {
     return position;
+  }
+
+  /**
+   * Returns the size of the object in bytes.
+   *
+   * <p>If the stream was opened without file info and no read has been issued yet, this may perform
+   * a metadata request. After the first read the size is known from the read response and no
+   * request is made.
+   */
+  public long size() throws IOException {
+    checkNotClosed("Cannot get size: already closed");
+    if (gcsFileInfo != null) {
+      return gcsFileInfo.getItemInfo().getSize();
+    }
+    long size = channel.size();
+    adoptResolvedItemInfo();
+    return size;
+  }
+
+  /**
+   * Adopts the metadata the channel learned from a read response, so that later operations (e.g.
+   * {@link #readTail}) do not need a metadata request. The resulting {@link GcsFileInfo} is
+   * partial: it carries size and generation but no object attributes.
+   */
+  private void adoptResolvedItemInfo() {
+    if (gcsFileInfo != null) {
+      return;
+    }
+    GcsItemInfo resolvedItemInfo = channel.getItemInfo();
+    if (resolvedItemInfo == null || resolvedItemInfo.getSize() < 0) {
+      return;
+    }
+    gcsItemId = resolvedItemInfo.getItemId();
+    gcsFileInfo =
+        GcsFileInfo.builder()
+            .setItemInfo(resolvedItemInfo)
+            .setUri(gcsPath)
+            .setAttributes(ImmutableMap.of())
+            .build();
   }
 
   @Override
@@ -144,6 +183,7 @@ public class GoogleCloudStorageInputStream extends SeekableInputStream {
                   position);
 
               int bytesRead = channel.read(byteBuffer);
+              adoptResolvedItemInfo();
               if (bytesRead > 0) {
                 position += bytesRead;
                 recorder.record(Metric.READ_BYTES, bytesRead, Collections.emptyMap());
@@ -223,12 +263,9 @@ public class GoogleCloudStorageInputStream extends SeekableInputStream {
             Metric.READ_DURATION,
             commonAttributes,
             recorder -> {
-              if (gcsFileInfo == null) {
-                gcsFileInfo = gcsFileSystem.getFileInfo(gcsItemId);
-              }
+              long size = size();
               try (VectoredSeekableByteChannel byteChannel =
                   openReadChannel(gcsFileSystem, gcsItemId, gcsFileInfo)) {
-                long size = gcsFileInfo.getItemInfo().getSize();
                 long startPosition = Math.max(0, size - length);
                 byteChannel.position(startPosition);
                 int bytesRead = byteChannel.read(ByteBuffer.wrap(buffer, offset, length));
