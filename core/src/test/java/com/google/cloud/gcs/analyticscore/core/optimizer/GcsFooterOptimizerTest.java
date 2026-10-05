@@ -400,6 +400,18 @@ class GcsFooterOptimizerTest {
   }
 
   @Test
+  void read_fileSizeUnknown_warmCache_doesNotRecordFooterCacheHit() throws IOException {
+    optimizer.onOpen(ITEM_ID, mockCacheManager);
+    when(mockCacheManager.getFooter(any(), any()))
+        .thenReturn(ByteBuffer.wrap(Arrays.copyOfRange(testData, 900, 1000)));
+    VectoredSeekableByteChannel mockSource = lazyMetadataChannel(new AtomicInteger(0));
+
+    int unused = optimizer.read(992, ByteBuffer.allocate(8), mockSource);
+
+    verify(telemetry, times(0)).recordMetric(eq(Metric.FOOTER_CACHE_HIT), anyLong(), any());
+  }
+
+  @Test
   void read_fileSizeUnknown_readTooLargeForFooter_passesThroughToDelegate() throws IOException {
     optimizer.onOpen(ITEM_ID, mockCacheManager);
     AtomicInteger dataReadCount = new AtomicInteger(0);

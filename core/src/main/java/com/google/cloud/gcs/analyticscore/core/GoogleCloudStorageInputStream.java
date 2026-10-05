@@ -115,20 +115,21 @@ public class GoogleCloudStorageInputStream extends SeekableInputStream {
       return gcsFileInfo.getItemInfo().getSize();
     }
     long size = channel.size();
-    adoptResolvedItemInfo();
+    adoptResolvedItemInfo(channel);
     return size;
   }
 
   /**
-   * Adopts the metadata the channel learned from a read response, so that later operations (e.g.
-   * {@link #readTail}) do not need a metadata request. The resulting {@link GcsFileInfo} is
-   * partial: it carries size and generation but no object attributes.
+   * Adopts the metadata {@code source} learned from a read response, so that later operations (e.g.
+   * {@link #readTail}, {@link #readFully}) open with file info and skip both the metadata request
+   * and the speculative footer read. The resulting {@link GcsFileInfo} is partial: it carries size
+   * and generation but no object attributes.
    */
-  private void adoptResolvedItemInfo() {
+  private void adoptResolvedItemInfo(VectoredSeekableByteChannel source) {
     if (gcsFileInfo != null) {
       return;
     }
-    GcsItemInfo resolvedItemInfo = channel.getItemInfo();
+    GcsItemInfo resolvedItemInfo = source.getItemInfo();
     if (resolvedItemInfo == null || resolvedItemInfo.getSize() < 0) {
       return;
     }
@@ -190,7 +191,7 @@ public class GoogleCloudStorageInputStream extends SeekableInputStream {
                   position);
 
               int bytesRead = channel.read(byteBuffer);
-              adoptResolvedItemInfo();
+              adoptResolvedItemInfo(channel);
               if (bytesRead > 0) {
                 position += bytesRead;
                 recorder.record(Metric.READ_BYTES, bytesRead, Collections.emptyMap());
@@ -249,6 +250,7 @@ public class GoogleCloudStorageInputStream extends SeekableInputStream {
                   openReadChannel(gcsFileSystem, gcsItemId, gcsFileInfo)) {
                 byteChannel.position(position);
                 int numberOfBytesRead = byteChannel.read(ByteBuffer.wrap(buffer, offset, length));
+                adoptResolvedItemInfo(byteChannel);
                 if (numberOfBytesRead < length) {
                   throw new EOFException(
                       "Reached the end of stream with "

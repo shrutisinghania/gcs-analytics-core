@@ -177,20 +177,12 @@ public class GcsFooterOptimizer implements FormatOptimizer {
       return copyOut(prefetchedBuffer, startPosition, position, dst);
     }
 
-    AtomicBoolean isMiss = new AtomicBoolean(false);
-    ByteBuffer footer =
-        cacheManager.getFooter(
-            gcsItemId,
-            itemId -> {
-              isMiss.set(true);
-              telemetry.recordMetric(Metric.FOOTER_CACHE_MISS, 1L, Collections.emptyMap());
-              return canonicalFooter;
-            });
+    // The bytes were fetched before the cache could be consulted (a cached footer can't be
+    // positioned without the object size), so this is a miss whether or not an entry already
+    // existed. Recording a hit here would report savings that did not happen.
+    telemetry.recordMetric(Metric.FOOTER_CACHE_MISS, 1L, Collections.emptyMap());
+    ByteBuffer footer = cacheManager.getFooter(gcsItemId, itemId -> canonicalFooter);
     adoptFooterBuffer(footer);
-
-    if (!isMiss.get()) {
-      telemetry.recordMetric(Metric.FOOTER_CACHE_HIT, 1L, Collections.emptyMap());
-    }
 
     return serveFromBuffer(position, dst);
   }

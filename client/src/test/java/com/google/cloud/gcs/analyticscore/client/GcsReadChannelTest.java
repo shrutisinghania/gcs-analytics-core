@@ -1558,6 +1558,46 @@ class GcsReadChannelTest {
     assertThat(gcsReadChannel.size()).isEqualTo(objectData.length());
   }
 
+  @Test
+  void read_objectNotFound_throwsFileNotFoundException() throws Exception {
+    GcsItemId itemId =
+        GcsItemId.builder().setBucketName("test-bucket").setObjectName("missing").build();
+    GcsReadChannel gcsReadChannel =
+        new GcsReadChannel(
+            notFoundStorage(), itemId, TEST_GCS_READ_OPTIONS, executorServiceSupplier, telemetry);
+
+    assertThrows(FileNotFoundException.class, () -> gcsReadChannel.read(ByteBuffer.allocate(5)));
+  }
+
+  @Test
+  void readVectored_objectNotFound_failsRangeWithFileNotFoundException() throws Exception {
+    GcsItemId itemId =
+        GcsItemId.builder().setBucketName("test-bucket").setObjectName("missing").build();
+    GcsReadChannel gcsReadChannel =
+        new GcsReadChannel(
+            notFoundStorage(), itemId, TEST_GCS_READ_OPTIONS, executorServiceSupplier, telemetry);
+    ImmutableList<GcsObjectRange> ranges = createRanges(ImmutableMap.of(0L, 5));
+
+    gcsReadChannel.readVectored(ranges, ByteBuffer::allocate);
+
+    ExecutionException e =
+        assertThrows(ExecutionException.class, () -> ranges.get(0).getByteBufferFuture().get());
+    assertThat(e.getCause()).isInstanceOf(FileNotFoundException.class);
+  }
+
+  private static Storage notFoundStorage() throws IOException {
+    Storage mockStorage = Mockito.mock(Storage.class);
+    ReflectiveReadChannel mockReadChannel = Mockito.mock(ReflectiveReadChannel.class);
+    Mockito.when(
+            mockStorage.reader(
+                Mockito.any(BlobId.class), Mockito.any(Storage.BlobSourceOption[].class)))
+        .thenReturn(mockReadChannel);
+    Mockito.when(mockReadChannel.isOpen()).thenReturn(true);
+    Mockito.when(mockReadChannel.read(Mockito.any(ByteBuffer.class)))
+        .thenThrow(new StorageException(404, "Not Found"));
+    return mockStorage;
+  }
+
   private String getGcsObjectRangeData(GcsObjectRange range)
       throws ExecutionException, InterruptedException {
     return StandardCharsets.UTF_8.decode(range.getByteBufferFuture().get()).toString();
