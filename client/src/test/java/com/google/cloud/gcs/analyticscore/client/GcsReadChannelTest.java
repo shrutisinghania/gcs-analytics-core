@@ -1260,7 +1260,7 @@ class GcsReadChannelTest {
   }
 
   @Test
-  void size_withoutItemInfo_metadataExtractionFails_secondCallDoesNotRetry() throws IOException {
+  void size_withoutItemInfo_beforeAnyRead_doesNotConsumeExtractionAttempt() throws IOException {
     GcsItemId itemId =
         GcsItemId.builder().setBucketName("test-bucket").setObjectName("test-object").build();
     Storage mockStorage = Mockito.mock(Storage.class);
@@ -1279,7 +1279,9 @@ class GcsReadChannelTest {
     assertThrows(IOException.class, gcsReadChannel::size);
     assertThrows(IOException.class, gcsReadChannel::size);
 
-    Mockito.verify(mockReadChannel, Mockito.times(1)).getStorageObject();
+    // Without a read response the extraction is inconclusive: it is tried again rather than being
+    // recorded as the single attempt, so that the first read can still resolve the metadata.
+    Mockito.verify(mockReadChannel, Mockito.times(2)).getStorageObject();
   }
 
   @Test
@@ -1512,6 +1514,48 @@ class GcsReadChannelTest {
     // Extraction is one-shot: after the first read completed, the response is already in hand, so
     // an SDK channel that does not expose metadata now never will.
     Mockito.verify(mockReadChannel, Mockito.times(1)).getStorageObject();
+  }
+
+  @Test
+  void size_beforeFirstReadWithoutProvider_doesNotConsumeExtractionAttempt() throws IOException {
+    GcsItemId itemId =
+        GcsItemId.builder().setBucketName("test-bucket").setObjectName("test-object").build();
+    String objectData = "hello world";
+    StorageObject storageObject =
+        new StorageObject().setSize(BigInteger.valueOf(objectData.length())).setGeneration(123L);
+    Storage mockStorage = Mockito.mock(Storage.class);
+    ReflectiveReadChannel mockReadChannel = Mockito.mock(ReflectiveReadChannel.class);
+    Mockito.when(
+            mockStorage.reader(
+                Mockito.any(BlobId.class), Mockito.any(Storage.BlobSourceOption[].class)))
+        .thenReturn(mockReadChannel);
+    Mockito.when(mockReadChannel.isOpen()).thenReturn(true);
+    // Like the SDK channel: created eagerly by the sequential strategy, but it only exposes the
+    // metadata once a read response came back.
+    AtomicInteger readCount = new AtomicInteger(0);
+    Mockito.when(mockReadChannel.read(Mockito.any(ByteBuffer.class)))
+        .thenAnswer(
+            invocation -> {
+              readCount.incrementAndGet();
+              ByteBuffer buf = invocation.getArgument(0);
+              int bytesToRead = Math.min(buf.remaining(), 5);
+              buf.put(objectData.substring(0, bytesToRead).getBytes(StandardCharsets.UTF_8));
+              return bytesToRead;
+            });
+    Mockito.when(mockReadChannel.getStorageObject())
+        .thenAnswer(invocation -> readCount.get() > 0 ? storageObject : null);
+    GcsReadChannel gcsReadChannel =
+        new GcsReadChannel(
+            mockStorage, itemId, TEST_GCS_READ_OPTIONS, executorServiceSupplier, telemetry);
+    // No response has been received yet, so there is nothing to extract from and no provider to
+    // fall back to.
+    assertThrows(IOException.class, gcsReadChannel::size);
+
+    int unused = gcsReadChannel.read(ByteBuffer.allocate(5));
+
+    // The failed size() must not have used up the single extraction attempt: the first read
+    // response is the first opportunity to learn the size, and it must be taken.
+    assertThat(gcsReadChannel.size()).isEqualTo(objectData.length());
   }
 
   private String getGcsObjectRangeData(GcsObjectRange range)

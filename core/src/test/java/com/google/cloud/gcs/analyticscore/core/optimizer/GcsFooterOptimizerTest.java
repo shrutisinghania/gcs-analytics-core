@@ -469,16 +469,32 @@ class GcsFooterOptimizerTest {
                 invocation.getArgument(1, AnalyticsCacheManager.FooterLoader.class).load(ITEM_ID));
     AtomicInteger dataReadCount = new AtomicInteger(0);
     VectoredSeekableByteChannel mockSource = fakeChannel(largeData, dataReadCount, largeItemInfo);
-    // Speculating around 4450 reads [3950, 4950): it overlaps the footer (which starts at 4900)
-    // without covering all of it.
+    // Speculating around 4450 reads [4350, 4550): it stops before the footer, which starts at 4900.
     int unused = optimizer.read(4450, ByteBuffer.allocate(8), mockSource);
 
-    // A footer read that extends past 4950 must not be served as a short 50-byte read.
+    // A footer read outside that window must be served in full from the canonical footer.
     ByteBuffer dst = ByteBuffer.allocate(100);
     int bytesRead = optimizer.read(4900, dst, mockSource);
 
     assertThat(bytesRead).isEqualTo(100);
     assertThat(dst.array()).isEqualTo(Arrays.copyOfRange(largeData, 4900, 5000));
+  }
+
+  @Test
+  void read_fileSizeUnknown_speculativeWindow_isSizedBySmallFilePrefetchSize() throws IOException {
+    optimizer.onOpen(ITEM_ID, mockCacheManager);
+    when(mockCacheManager.getFooter(eq(ITEM_ID), any()))
+        .thenAnswer(
+            invocation ->
+                invocation.getArgument(1, AnalyticsCacheManager.FooterLoader.class).load(ITEM_ID));
+    VectoredSeekableByteChannel mockSource = lazyMetadataChannel(new AtomicInteger(0));
+
+    int unused = optimizer.read(992, ByteBuffer.allocate(8), mockSource);
+
+    // Options are small = 100, large = 500. Most objects are small, so the window must start at
+    // 992 - 100, not 992 - 500: guessing large would over-fetch on every small object, while
+    // guessing small on a large object only costs a second canonical footer load.
+    verify(mockSource).position(892L);
   }
 
   @Test

@@ -25,6 +25,7 @@ import com.google.cloud.gcs.analyticscore.core.channel.SmartReadChannel;
 import com.google.cloud.gcs.analyticscore.core.optimizer.GcsFooterOptimizer;
 import com.google.cloud.gcs.analyticscore.core.optimizer.SmallObjectOptimizer;
 import com.google.cloud.storage.BlobId;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableMap;
 import java.io.EOFException;
 import java.io.IOException;
@@ -44,12 +45,17 @@ public class GoogleCloudStorageInputStream extends SeekableInputStream {
   private final VectoredSeekableByteChannel channel;
   private long position;
   private final URI gcsPath;
-  private volatile GcsItemId gcsItemId;
+  private GcsItemId gcsItemId;
   private final ImmutableMap<String, String> commonAttributes;
 
   private volatile boolean closed;
 
-  private volatile GcsFileInfo gcsFileInfo;
+  /**
+   * Metadata of the object. Either supplied at creation, or adopted from the channel once a read
+   * response resolved it (see {@link #adoptResolvedItemInfo}); in the latter case it is partial and
+   * carries no object attributes.
+   */
+  private GcsFileInfo gcsFileInfo;
 
   public static GoogleCloudStorageInputStream create(
       GcsFileSystem gcsFileSystem, GcsFileInfo gcsFileInfo) throws IOException {
@@ -102,7 +108,8 @@ public class GoogleCloudStorageInputStream extends SeekableInputStream {
    * a metadata request. After the first read the size is known from the read response and no
    * request is made.
    */
-  public long size() throws IOException {
+  @VisibleForTesting
+  long size() throws IOException {
     checkNotClosed("Cannot get size: already closed");
     if (gcsFileInfo != null) {
       return gcsFileInfo.getItemInfo().getSize();

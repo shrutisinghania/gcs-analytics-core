@@ -267,12 +267,15 @@ public class GcsFooterOptimizer implements FormatOptimizer {
         && dst.remaining() <= estimatedPrefetchSize;
   }
 
+  /**
+   * Size of the speculative window, taken from the small-file footer size. The object size is
+   * unknown at this point and most objects are below {@link #LARGE_FILE_SIZE_THRESHOLD}: guessing
+   * the large-file size would over-fetch by its ratio on every small object (20x with the
+   * defaults), whereas guessing too small on a large object only costs a second, canonical footer
+   * load.
+   */
   private long estimatePrefetchSize() {
-    return Math.min(
-        Math.max(
-            readOptions.getFooterPrefetchSizeLargeFile(),
-            readOptions.getFooterPrefetchSizeSmallFile()),
-        MAX_SPECULATIVE_PREFETCH_SIZE);
+    return Math.min(readOptions.getFooterPrefetchSizeSmallFile(), MAX_SPECULATIVE_PREFETCH_SIZE);
   }
 
   /**

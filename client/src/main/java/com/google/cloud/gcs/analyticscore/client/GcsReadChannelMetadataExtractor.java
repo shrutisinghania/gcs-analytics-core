@@ -210,6 +210,7 @@ final class GcsReadChannelMetadataExtractor {
             return resolvedMetadata;
           }
         } catch (NoSuchMethodException ignored) {
+          // Expected: the candidate accessor does not exist on this class; try the next one.
         } catch (ReflectiveOperationException | RuntimeException e) {
           LOG.debug("Failed invoking method {} on {}", methodName, clazz.getName(), e);
         }
@@ -224,6 +225,7 @@ final class GcsReadChannelMetadataExtractor {
             return resolvedMetadata;
           }
         } catch (NoSuchFieldException ignored) {
+          // Expected: the candidate field does not exist on this class; try the next one.
         } catch (ReflectiveOperationException | RuntimeException e) {
           LOG.debug("Failed reading field {} on {}", fieldName, clazz.getName(), e);
         }

@@ -297,7 +297,7 @@ class GcsBidiReadChannel extends GcsReadChannel {
       } catch (FileNotFoundException e) {
         throw e;
       } catch (IOException e) {
-        logger.debug("Falling back to item info lookup for {}: {}", blobId, e.getMessage(), e);
+        logger.debug("Falling back to item info lookup for {}", blobId, e);
         try {
           this.objectSize = super.size();
         } catch (IOException fallbackFailure) {

@@ -58,6 +58,7 @@ abstract class AbstractReadStrategy implements ReadStrategy {
 
   @Override
   public void updateItemInfo(GcsItemInfo itemInfo) {
+    checkArgument(itemInfo.getSize() >= 0, "Resolved item info must have a size, got %s", itemInfo);
     this.itemInfo = itemInfo;
     if (itemInfo.getItemId().getContentGeneration().isPresent()) {
       this.itemId = itemInfo.getItemId();
