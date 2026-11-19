@@ -249,7 +249,21 @@ public class GoogleCloudStorageInputStream extends SeekableInputStream {
             Metric.READ_DURATION,
             COMMON_ATTRIBUTES,
             recorder -> {
+              checkNotClosed("Cannot readFully: already closed");
               adoptResolvedItemInfo(channel);
+              if (channel.isPositionedReadSupported()) {
+                ByteBuffer dst = ByteBuffer.wrap(buffer, offset, length);
+                int totalBytesRead = Math.max(0, channel.read(position, dst));
+                adoptResolvedItemInfo(channel);
+                if (totalBytesRead < length) {
+                  throw new EOFException(
+                      "Reached the end of stream with "
+                          + (length - totalBytesRead)
+                          + " bytes left to read");
+                }
+                recorder.record(Metric.READ_BYTES, totalBytesRead, Collections.emptyMap());
+                return null;
+              }
               try (VectoredSeekableByteChannel byteChannel =
                   openReadChannel(gcsFileSystem, gcsItemId, gcsFileInfo)) {
                 byteChannel.position(position);
@@ -277,6 +291,20 @@ public class GoogleCloudStorageInputStream extends SeekableInputStream {
             COMMON_ATTRIBUTES,
             recorder -> {
               long size = size();
+              if (channel.isPositionedReadSupported()) {
+                if (size == 0) {
+                  return -1;
+                }
+                long startPosition = Math.max(0, size - length);
+                int toRead = (int) Math.min(length, size - startPosition);
+                int bytesRead =
+                    channel.read(startPosition, ByteBuffer.wrap(buffer, offset, toRead));
+                adoptResolvedItemInfo(channel);
+                if (bytesRead > 0) {
+                  recorder.record(Metric.READ_BYTES, bytesRead, Collections.emptyMap());
+                }
+                return bytesRead;
+              }
               try (VectoredSeekableByteChannel byteChannel =
                   openReadChannel(gcsFileSystem, gcsItemId, gcsFileInfo)) {
                 long startPosition = Math.max(0, size - length);

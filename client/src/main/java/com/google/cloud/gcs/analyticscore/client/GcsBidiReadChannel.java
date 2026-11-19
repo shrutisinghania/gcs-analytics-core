@@ -44,6 +44,8 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.IntFunction;
 import javax.annotation.Nullable;
 import org.slf4j.Logger;
@@ -51,13 +53,53 @@ import org.slf4j.LoggerFactory;
 
 class GcsBidiReadChannel extends GcsReadChannel {
   private static final Logger logger = LoggerFactory.getLogger(GcsBidiReadChannel.class);
+  static final int DEFAULT_READ_BUFFER_CHUNK_SIZE = 2 * 1024 * 1024;
+
+  /**
+   * Immutable heap-backed look-ahead chunk. Copying {@link DisposableByteString} bytes into a plain
+   * {@code byte[]} releases Netty's pooled direct buffer immediately and allows lock-free reads
+   * across both {@link #read(ByteBuffer)} and concurrent {@link #read(long, ByteBuffer)} calls.
+   */
+  private static final class BufferChunk {
+    final long startOffset;
+    final byte[] data;
+
+    BufferChunk(long startOffset, byte[] data) {
+      this.startOffset = startOffset;
+      this.data = data;
+    }
+
+    boolean contains(long offset) {
+      return offset >= startOffset && offset < startOffset + data.length;
+    }
+
+    int copyTo(long offset, ByteBuffer dst) {
+      int relOffset = (int) (offset - startOffset);
+      int available = data.length - relOffset;
+      int bytesToCopy = Math.min(dst.remaining(), available);
+      if (bytesToCopy <= 0) {
+        return 0;
+      }
+      dst.put(data, relOffset, bytesToCopy);
+      return bytesToCopy;
+    }
+  }
 
   private final long bidiClientTimeoutSeconds;
+  private final int readBufferChunkSize;
   private final BlobId blobId;
+  @Nullable private final BidiSessionPool sessionPool;
+  @Nullable private final BidiSessionPool.PooledSession pooledSession;
+  private final ApiFuture<BlobReadSession> sessionFuture;
   private volatile BlobReadSession blobReadSession;
+  private volatile BufferChunk internalChunk;
+
+  private final AtomicInteger pendingReads = new AtomicInteger(0);
+  private final AtomicBoolean closeInitiated = new AtomicBoolean(false);
+  private final AtomicBoolean sessionReleased = new AtomicBoolean(false);
+  private volatile boolean sessionFailed = false;
   private volatile boolean closed = false;
   private volatile long position = 0;
-  private final ApiFuture<BlobReadSession> sessionFuture;
 
   private volatile long objectSize = -1;
   private volatile boolean metadataInitialized = false;
@@ -69,10 +111,30 @@ class GcsBidiReadChannel extends GcsReadChannel {
       Supplier<ExecutorService> executorServiceSupplier,
       Telemetry telemetry)
       throws IOException {
+    this(storage, itemInfo, readOptions, executorServiceSupplier, telemetry, null);
+  }
+
+  GcsBidiReadChannel(
+      Storage storage,
+      GcsItemInfo itemInfo,
+      GcsReadOptions readOptions,
+      Supplier<ExecutorService> executorServiceSupplier,
+      Telemetry telemetry,
+      @Nullable BidiSessionPool sessionPool)
+      throws IOException {
     super(storage, itemInfo, readOptions, executorServiceSupplier, telemetry);
     this.bidiClientTimeoutSeconds = readOptions.getBidiTimeout();
+    this.readBufferChunkSize = readOptions.getChunkSize().orElse(DEFAULT_READ_BUFFER_CHUNK_SIZE);
     this.blobId = initBlobId();
-    this.sessionFuture = storage.blobReadSession(blobId);
+    this.sessionPool = sessionPool;
+    if (sessionPool != null) {
+      this.pooledSession = sessionPool.acquire(storage, blobId);
+      this.sessionFuture = this.pooledSession.getSessionFuture();
+      this.blobReadSession = this.pooledSession.getResolvedSession();
+    } else {
+      this.pooledSession = null;
+      this.sessionFuture = storage.blobReadSession(blobId);
+    }
   }
 
   GcsBidiReadChannel(
@@ -82,7 +144,7 @@ class GcsBidiReadChannel extends GcsReadChannel {
       Supplier<ExecutorService> executorServiceSupplier,
       Telemetry telemetry)
       throws IOException {
-    this(storage, itemId, readOptions, executorServiceSupplier, telemetry, null);
+    this(storage, itemId, readOptions, executorServiceSupplier, telemetry, null, null);
   }
 
   GcsBidiReadChannel(
@@ -91,12 +153,33 @@ class GcsBidiReadChannel extends GcsReadChannel {
       GcsReadOptions readOptions,
       Supplier<ExecutorService> executorServiceSupplier,
       Telemetry telemetry,
-      ItemInfoProvider itemInfoProvider)
+      @Nullable ItemInfoProvider itemInfoProvider)
+      throws IOException {
+    this(storage, itemId, readOptions, executorServiceSupplier, telemetry, itemInfoProvider, null);
+  }
+
+  GcsBidiReadChannel(
+      Storage storage,
+      GcsItemId itemId,
+      GcsReadOptions readOptions,
+      Supplier<ExecutorService> executorServiceSupplier,
+      Telemetry telemetry,
+      @Nullable ItemInfoProvider itemInfoProvider,
+      @Nullable BidiSessionPool sessionPool)
       throws IOException {
     super(storage, itemId, readOptions, executorServiceSupplier, telemetry, itemInfoProvider);
     this.bidiClientTimeoutSeconds = readOptions.getBidiTimeout();
+    this.readBufferChunkSize = readOptions.getChunkSize().orElse(DEFAULT_READ_BUFFER_CHUNK_SIZE);
     this.blobId = initBlobId();
-    this.sessionFuture = storage.blobReadSession(blobId);
+    this.sessionPool = sessionPool;
+    if (sessionPool != null) {
+      this.pooledSession = sessionPool.acquire(storage, blobId);
+      this.sessionFuture = this.pooledSession.getSessionFuture();
+      this.blobReadSession = this.pooledSession.getResolvedSession();
+    } else {
+      this.pooledSession = null;
+      this.sessionFuture = storage.blobReadSession(blobId);
+    }
   }
 
   @Override
@@ -138,23 +221,85 @@ class GcsBidiReadChannel extends GcsReadChannel {
   }
 
   @Override
+  public boolean isOpen() {
+    return !closed && super.isOpen();
+  }
+
+  @Override
+  public boolean isPositionedReadSupported() {
+    return true;
+  }
+
+  @Override
   public int read(ByteBuffer dst) throws IOException {
-    if (!isOpen()) {
-      throw new ClosedChannelException();
+    pendingReads.incrementAndGet();
+    try {
+      if (!isOpen()) {
+        throw new ClosedChannelException();
+      }
+      if (!dst.hasRemaining()) {
+        return 0;
+      }
+      long objSize = size();
+      long currentPosition = this.position;
+      if (currentPosition >= objSize) {
+        return -1;
+      }
+      int bytesRead = readAtOffset(currentPosition, dst, objSize);
+      if (bytesRead > 0) {
+        this.position = currentPosition + bytesRead;
+      }
+      return bytesRead;
+    } finally {
+      decrementPendingReads(1);
     }
-    if (!dst.hasRemaining()) {
+  }
+
+  @Override
+  public int read(long offset, ByteBuffer dst) throws IOException {
+    pendingReads.incrementAndGet();
+    try {
+      if (!isOpen()) {
+        throw new ClosedChannelException();
+      }
+      if (offset < 0) {
+        throw new EOFException(
+            String.format(
+                "Invalid seek offset: position value (%d) must be >= 0 for '%s'", offset, itemId));
+      }
+      if (!dst.hasRemaining()) {
+        return 0;
+      }
+      long objSize = size();
+      if (offset >= objSize) {
+        return -1;
+      }
+      return readAtOffset(offset, dst, objSize);
+    } finally {
+      decrementPendingReads(1);
+    }
+  }
+
+  private int readAtOffset(long offset, ByteBuffer dst, long objSize) throws IOException {
+    BufferChunk chunk = this.internalChunk;
+    if (chunk != null && chunk.contains(offset)) {
+      return chunk.copyTo(offset, dst);
+    }
+
+    int requested = dst.remaining();
+    if (readBufferChunkSize <= 0 || requested >= readBufferChunkSize) {
+      long bytesToRequest = Math.min((long) requested, objSize - offset);
+      return readBytesFromSession(dst, offset, bytesToRequest);
+    }
+
+    long chunkBytesToRequest = Math.min((long) readBufferChunkSize, objSize - offset);
+    byte[] fetched = fetchBytesFromSession(offset, chunkBytesToRequest);
+    if (fetched.length == 0) {
       return 0;
     }
-    long objectSize = size();
-    if (position >= objectSize) {
-      return -1;
-    }
-    long bytesToRequest = Math.min((long) dst.remaining(), objectSize - position);
-    int bytesRead = readBytesFromSession(dst, position, bytesToRequest);
-    if (bytesRead > 0) {
-      position += bytesRead;
-    }
-    return bytesRead;
+    BufferChunk newChunk = new BufferChunk(offset, fetched);
+    this.internalChunk = newChunk;
+    return newChunk.copyTo(offset, dst);
   }
 
   @Override
@@ -210,44 +355,86 @@ class GcsBidiReadChannel extends GcsReadChannel {
     if (pendingRanges.isEmpty()) {
       return;
     }
+
+    pendingReads.incrementAndGet();
+    GcsVectoredReadOptions vectoredReadOptions = readOptions.getGcsVectoredReadOptions();
+    ImmutableList<GcsObjectCombinedRange> combinedRanges;
     BlobReadSession session;
     try {
+      if (closed) {
+        ClosedChannelException e =
+            new ClosedChannelException() {
+              @Override
+              public String getMessage() {
+                return "Reader is closed.";
+              }
+            };
+        for (GcsObjectRange range : pendingRanges) {
+          range.getByteBufferFuture().completeExceptionally(e);
+        }
+        throw e;
+      }
       session = getBlobReadSession();
+      combinedRanges =
+          VectoredIoUtil.mergeGcsObjectRanges(
+              pendingRanges,
+              vectoredReadOptions.getMaxMergeGap(),
+              vectoredReadOptions.getMaxMergeSize());
+      pendingReads.addAndGet(combinedRanges.size());
     } catch (IOException | RuntimeException e) {
       for (GcsObjectRange range : pendingRanges) {
         range.getByteBufferFuture().completeExceptionally(e);
       }
       throw e;
+    } finally {
+      decrementPendingReads(1);
     }
-    GcsVectoredReadOptions vectoredReadOptions = readOptions.getGcsVectoredReadOptions();
-    ImmutableList<GcsObjectCombinedRange> combinedRanges =
-        VectoredIoUtil.mergeGcsObjectRanges(
-            pendingRanges,
-            vectoredReadOptions.getMaxMergeGap(),
-            vectoredReadOptions.getMaxMergeSize());
+
     for (GcsObjectCombinedRange combinedRange : combinedRanges) {
       try {
         readAndAttachCallback(combinedRange, session, allocate);
       } catch (RuntimeException e) {
+        sessionFailed = true;
         completeWithException(combinedRange, e);
+        decrementPendingReads(1);
       }
     }
   }
 
   @Override
   public void close() throws IOException {
-    if (closed) {
+    if (!closeInitiated.compareAndSet(false, true)) {
       return;
     }
     synchronized (this) {
       closed = true;
+      internalChunk = null;
+      super.close();
+    }
+    if (pendingReads.get() == 0) {
+      releaseSessionOnce();
+    }
+  }
+
+  private void decrementPendingReads(int count) {
+    if (pendingReads.addAndGet(-count) == 0 && closeInitiated.get()) {
+      releaseSessionOnce();
+    }
+  }
+
+  private void releaseSessionOnce() {
+    if (!sessionReleased.compareAndSet(false, true)) {
+      return;
+    }
+    BlobReadSession session = blobReadSession;
+    blobReadSession = null;
+    if (sessionPool != null && pooledSession != null) {
+      sessionPool.release(blobId, pooledSession, !sessionFailed);
+    } else if (session != null) {
       try {
-        super.close();
-      } finally {
-        if (blobReadSession != null) {
-          blobReadSession.close();
-          blobReadSession = null;
-        }
+        session.close();
+      } catch (IOException e) {
+        logger.debug("Exception closing BlobReadSession for {}", blobId, e);
       }
     }
   }
@@ -256,10 +443,43 @@ class GcsBidiReadChannel extends GcsReadChannel {
     String bucketName = itemId.getBucketName();
     checkArgument(itemId.getObjectName().isPresent(), "ObjectName cannot be empty");
     String objectName = itemId.getObjectName().get();
-    return itemId
-        .getContentGeneration()
+    java.util.Optional<Long> generation =
+        itemId.getContentGeneration().isPresent()
+            ? itemId.getContentGeneration()
+            : (itemInfo != null ? itemInfo.getContentGeneration() : java.util.Optional.empty());
+    return generation
         .map(gen -> BlobId.of(bucketName, objectName, gen))
         .orElse(BlobId.of(bucketName, objectName));
+  }
+
+  private byte[] fetchBytesFromSession(long offset, long length) throws IOException {
+    BlobReadSession session = getBlobReadSession();
+    ApiFuture<DisposableByteString> futureBytes =
+        session.readAs(
+            ReadProjectionConfigs.asFutureByteString().withRangeSpec(RangeSpec.of(offset, length)));
+    try (DisposableByteString dbs = futureBytes.get(bidiClientTimeoutSeconds, TimeUnit.SECONDS)) {
+      ByteString byteString = dbs.byteString();
+      return byteString.isEmpty() ? new byte[0] : byteString.toByteArray();
+    } catch (InterruptedException e) {
+      sessionFailed = true;
+      futureBytes.cancel(true);
+      Thread.currentThread().interrupt();
+      throw new IOException("Thread interrupted while reading from stream", e);
+    } catch (ExecutionException e) {
+      sessionFailed = true;
+      Throwable cause = e.getCause();
+      if (cause instanceof StorageException && ((StorageException) cause).getCode() == 404) {
+        throw new FileNotFoundException("Object not found during read: " + blobId);
+      }
+      if (cause instanceof RuntimeException) {
+        throw (RuntimeException) cause;
+      }
+      throw new IOException("Failed to read bytes from bidirectional session", e);
+    } catch (TimeoutException e) {
+      sessionFailed = true;
+      futureBytes.cancel(true);
+      throw new IOException("Timed out waiting for bytes from bidirectional stream", e);
+    }
   }
 
   private int readBytesFromSession(ByteBuffer dst, long offset, long length) throws IOException {
@@ -275,10 +495,12 @@ class GcsBidiReadChannel extends GcsReadChannel {
       }
       return bytesRead;
     } catch (InterruptedException e) {
+      sessionFailed = true;
       futureBytes.cancel(true);
       Thread.currentThread().interrupt();
       throw new IOException("Thread interrupted while reading from stream", e);
     } catch (ExecutionException e) {
+      sessionFailed = true;
       Throwable cause = e.getCause();
       if (cause instanceof StorageException && ((StorageException) cause).getCode() == 404) {
         throw new FileNotFoundException("Object not found during read: " + blobId);
@@ -288,6 +510,7 @@ class GcsBidiReadChannel extends GcsReadChannel {
       }
       throw new IOException("Failed to read bytes from bidirectional session", e);
     } catch (TimeoutException e) {
+      sessionFailed = true;
       futureBytes.cancel(true);
       throw new IOException("Timed out waiting for bytes from bidirectional stream", e);
     }
@@ -354,16 +577,22 @@ class GcsBidiReadChannel extends GcsReadChannel {
       if (blobReadSession == null) {
         try {
           blobReadSession = this.sessionFuture.get(bidiClientTimeoutSeconds, TimeUnit.SECONDS);
+          if (pooledSession != null && blobReadSession != null) {
+            pooledSession.setResolvedSession(blobReadSession);
+          }
         } catch (InterruptedException e) {
+          sessionFailed = true;
           Thread.currentThread().interrupt();
           throw new IOException("Failed to get BlobReadSession due to thread interruption", e);
         } catch (ExecutionException e) {
+          sessionFailed = true;
           Throwable cause = e.getCause();
           if (cause instanceof StorageException && ((StorageException) cause).getCode() == 404) {
             throw new FileNotFoundException("Object not found: " + blobId);
           }
           throw new IOException("Failed to get BlobReadSession", e);
         } catch (TimeoutException e) {
+          sessionFailed = true;
           throw new IOException("Failed to get BlobReadSession due to client timeout limit", e);
         }
       }
@@ -385,13 +614,18 @@ class GcsBidiReadChannel extends GcsReadChannel {
         new ApiFutureCallback<DisposableByteString>() {
           @Override
           public void onFailure(Throwable t) {
-            completeWithException(combinedRange, t);
-            logger.debug(
-                "Vectored Read failed for combined range starting from {} with length {} "
-                    + "({} underlying ranges)",
-                combinedRange.getOffset(),
-                combinedRange.getLength(),
-                combinedRange.getUnderlyingRanges().size());
+            try {
+              sessionFailed = true;
+              completeWithException(combinedRange, t);
+              logger.debug(
+                  "Vectored Read failed for combined range starting from {} with length {} "
+                      + "({} underlying ranges)",
+                  combinedRange.getOffset(),
+                  combinedRange.getLength(),
+                  combinedRange.getUnderlyingRanges().size());
+            } finally {
+              decrementPendingReads(1);
+            }
           }
 
           @Override
@@ -400,6 +634,8 @@ class GcsBidiReadChannel extends GcsReadChannel {
               processBytesAndCompleteRanges(disposableByteString, combinedRange, allocate);
             } catch (Throwable t) {
               completeWithException(combinedRange, t);
+            } finally {
+              decrementPendingReads(1);
             }
           }
         },
@@ -430,7 +666,6 @@ class GcsBidiReadChannel extends GcsReadChannel {
       buf.flip();
       ImmutableList<GcsObjectRange> underlyingRanges = combinedRange.getUnderlyingRanges();
       if (underlyingRanges.size() == 1 && bytesRead >= combinedRange.getLength()) {
-        // Single range that was fully read: hand the buffer over without slicing.
         underlyingRanges.get(0).getByteBufferFuture().complete(buf);
         return;
       }
@@ -440,11 +675,6 @@ class GcsBidiReadChannel extends GcsReadChannel {
     }
   }
 
-  /**
-   * Completes {@code underlyingRange} with a view over {@code dataBuffer} if the bytes actually
-   * returned for {@code combinedRange} cover it entirely; otherwise fails it with an {@link
-   * EOFException} rather than handing out a truncated buffer.
-   */
   private void completeUnderlyingRange(
       GcsObjectCombinedRange combinedRange,
       GcsObjectRange underlyingRange,

@@ -107,6 +107,41 @@ public class SmartReadChannel implements VectoredSeekableByteChannel {
   }
 
   @Override
+  public boolean isPositionedReadSupported() {
+    return delegate.isPositionedReadSupported();
+  }
+
+  @Override
+  public int read(long offset, ByteBuffer dst) throws IOException {
+    if (offset < 0) {
+      return delegate.read(offset, dst);
+    }
+    if (!dst.hasRemaining()) {
+      return 0;
+    }
+    int totalRead = 0;
+    long currentPos = offset;
+    while (dst.hasRemaining()) {
+      int stepRead = 0;
+      for (FormatOptimizer optimizer : optimizers) {
+        stepRead = optimizer.read(currentPos, dst, delegate);
+        if (stepRead != 0) {
+          break;
+        }
+      }
+      if (stepRead == 0) {
+        stepRead = delegate.read(currentPos, dst);
+      }
+      if (stepRead <= 0) {
+        return totalRead == 0 ? stepRead : totalRead;
+      }
+      currentPos += stepRead;
+      totalRead += stepRead;
+    }
+    return totalRead;
+  }
+
+  @Override
   public void readVectored(List<GcsObjectRange> ranges, IntFunction<ByteBuffer> allocate)
       throws IOException {
     List<GcsObjectRange> remainingRanges = ranges;

@@ -134,7 +134,7 @@ class VectoredIoUtil {
     ByteBuffer result = dataBuffer.slice();
     result.position(requestOffset);
     result.limit(requestOffset + requestLength);
-    return result;
+    return result.slice();
   }
 
   private static @NonNull GcsObjectCombinedRange buildCombinedRange(

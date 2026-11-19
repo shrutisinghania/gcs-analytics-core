@@ -38,4 +38,19 @@ public interface VectoredSeekableByteChannel extends SeekableByteChannel {
   default GcsItemInfo getItemInfo() {
     return null;
   }
+
+  /**
+   * Reads {@code dst.remaining()} bytes starting at {@code offset} without changing {@link
+   * #position()}.
+   *
+   * @return the number of bytes read, or {@code -1} if {@code offset} is at or beyond EOF.
+   */
+  default int read(long offset, ByteBuffer dst) throws IOException {
+    throw new UnsupportedOperationException("Positioned read is not supported by this channel.");
+  }
+
+  /** Returns whether {@link #read(long, ByteBuffer)} is supported by this channel. */
+  default boolean isPositionedReadSupported() {
+    return false;
+  }
 }

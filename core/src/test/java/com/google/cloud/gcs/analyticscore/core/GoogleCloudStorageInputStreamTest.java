@@ -843,4 +843,56 @@ class GoogleCloudStorageInputStreamTest {
                 GcsAnalyticsCoreTelemetryConstants.Operation.READ_CLOSE.name(), expectedAttrs))
         .inOrder();
   }
+
+  @Test
+  void readFullyAndReadTail_whenPositionedReadSupported_reuseOpenChannelWithoutReopening()
+      throws IOException {
+    GcsItemInfo resolvedItemInfo =
+        GcsItemInfo.builder().setItemId(testGcsItemId).setSize(fileSize).build();
+    GcsFileInfo fileInfo =
+        GcsFileInfo.builder()
+            .setItemInfo(resolvedItemInfo)
+            .setUri(testUri)
+            .setAttributes(ImmutableMap.of())
+            .build();
+    VectoredSeekableByteChannel positionedChannel = mock(VectoredSeekableByteChannel.class);
+    when(positionedChannel.isOpen()).thenReturn(true);
+    when(positionedChannel.isPositionedReadSupported()).thenReturn(true);
+    when(positionedChannel.getItemInfo()).thenReturn(resolvedItemInfo);
+    when(positionedChannel.read(org.mockito.ArgumentMatchers.anyLong(), any(ByteBuffer.class)))
+        .thenAnswer(
+            invocation -> {
+              long offset = invocation.getArgument(0);
+              ByteBuffer dst = invocation.getArgument(1);
+              int toCopy = (int) Math.min(dst.remaining(), fileSize - offset);
+              dst.put(testData, (int) offset, toCopy);
+              return toCopy;
+            });
+
+    GcsFileSystem mockFileSystem = mock(GcsFileSystem.class);
+    when(mockFileSystem.getFileSystemOptions()).thenReturn(fileSystemOptions);
+    when(mockFileSystem.getTelemetry()).thenReturn(new Telemetry(ImmutableList.of()));
+    when(mockFileSystem.getCacheManager()).thenReturn(fakeFileSystem.getCacheManager());
+    when(mockFileSystem.open(any(GcsFileInfo.class), any())).thenReturn(positionedChannel);
+
+    try (GoogleCloudStorageInputStream stream =
+        GoogleCloudStorageInputStream.create(mockFileSystem, fileInfo)) {
+      byte[] buf = new byte[10];
+      stream.readFully(200L, buf, 0, 10);
+      for (int i = 0; i < 10; i++) {
+        assertThat(buf[i]).isEqualTo(testData[200 + i]);
+      }
+
+      byte[] tailBuf = new byte[10];
+      int tailRead = stream.readTail(tailBuf, 0, 10);
+      assertThat(tailRead).isEqualTo(10);
+      for (int i = 0; i < 10; i++) {
+        assertThat(tailBuf[i]).isEqualTo(testData[(int) fileSize - 10 + i]);
+      }
+      assertThat(stream.getPos()).isEqualTo(0L);
+    }
+
+    verify(mockFileSystem, times(1)).open(any(GcsFileInfo.class), any());
+    verify(mockFileSystem, never()).open(any(GcsItemId.class), any());
+  }
 }

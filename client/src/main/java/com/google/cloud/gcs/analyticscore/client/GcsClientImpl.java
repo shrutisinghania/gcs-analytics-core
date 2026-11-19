@@ -141,6 +141,7 @@ class GcsClientImpl implements GcsClient {
   private Supplier<ExecutorService> executorServiceSupplier;
   private final Telemetry telemetry;
   private final AnalyticsCache<String, BucketProperties> bucketPropertiesCache;
+  private final BidiSessionPool bidiSessionPool = new BidiSessionPool();
   @VisibleForTesting volatile StorageControlClient storageControlClient;
   private volatile boolean isClosed = false;
 
@@ -238,7 +239,7 @@ class GcsClientImpl implements GcsClient {
 
     if (clientOptions.isBidiEnabled()) {
       return new GcsBidiReadChannel(
-          storage, gcsItemInfo, readOptions, executorServiceSupplier, telemetry);
+          storage, gcsItemInfo, readOptions, executorServiceSupplier, telemetry, bidiSessionPool);
     }
 
     return new GcsReadChannel(
@@ -253,7 +254,13 @@ class GcsClientImpl implements GcsClient {
     ItemInfoProvider itemInfoProvider = this::getGcsItemInfo;
     if (clientOptions.isBidiEnabled()) {
       return new GcsBidiReadChannel(
-          storage, gcsItemId, readOptions, executorServiceSupplier, telemetry, itemInfoProvider);
+          storage,
+          gcsItemId,
+          readOptions,
+          executorServiceSupplier,
+          telemetry,
+          itemInfoProvider,
+          bidiSessionPool);
     } else {
       return new GcsReadChannel(
           storage, gcsItemId, readOptions, executorServiceSupplier, telemetry, itemInfoProvider);
@@ -268,6 +275,7 @@ class GcsClientImpl implements GcsClient {
     GcsWriteOptions resolvedWriteOptions =
         Optional.ofNullable(writeOptions).orElseGet(() -> GcsWriteOptions.builder().build());
     BlobInfo blobInfo = createBlobInfo(itemId, resolvedWriteOptions);
+    bidiSessionPool.invalidate(itemId);
 
     try {
       BlobWriteOption[] sdkWriteOptions = resolvedWriteOptions.generateWriteOptions(itemId);
@@ -683,6 +691,7 @@ class GcsClientImpl implements GcsClient {
 
   @Override
   public void close() {
+    bidiSessionPool.close();
     try {
       storage.close();
     } catch (Exception e) {
@@ -799,6 +808,7 @@ class GcsClientImpl implements GcsClient {
     checkNotNull(itemId, "itemId must not be null");
     checkArgument(itemId.isGcsObject(), "Expected a GCS object itemId but got: " + itemId);
     checkNotNull(options, "options must not be null");
+    bidiSessionPool.invalidate(itemId);
     try {
       createEmptyObjectInternal(itemId, options);
     } catch (StorageException e) {

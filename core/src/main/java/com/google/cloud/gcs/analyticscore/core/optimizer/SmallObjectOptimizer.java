@@ -85,7 +85,7 @@ public class SmallObjectOptimizer implements FormatOptimizer {
   }
 
   @Override
-  public int read(long position, ByteBuffer dst, VectoredSeekableByteChannel source)
+  public synchronized int read(long position, ByteBuffer dst, VectoredSeekableByteChannel source)
       throws IOException {
     if (fileSize == -1 || fileSize > readOptions.getSmallObjectCacheThresholdBytes()) {
       return 0;
@@ -161,6 +161,21 @@ public class SmallObjectOptimizer implements FormatOptimizer {
 
   private ByteBuffer ensureCached(VectoredSeekableByteChannel source) throws IOException {
     ByteBuffer buffer = ByteBuffer.allocate((int) fileSize);
+    if (source.isPositionedReadSupported()) {
+      long pos = 0;
+      while (buffer.hasRemaining()) {
+        int n = source.read(pos, buffer);
+        if (n == -1) {
+          throw new IOException("Unexpected EOF encountered while reading small object.");
+        }
+        if (n == 0) {
+          break;
+        }
+        pos += n;
+      }
+      buffer.flip();
+      return buffer;
+    }
     long originalPosition = source.position();
     try {
       source.position(0);

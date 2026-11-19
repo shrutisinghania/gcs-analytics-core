@@ -1117,6 +1117,80 @@ class GcsBidiReadChannelTest {
     }
   }
 
+  @Test
+  void read_smallSequentialReads_buffersInChunkAndMakesSingleRpc() throws Exception {
+    GcsItemInfo itemInfo = GcsItemInfo.builder().setItemId(itemId).setSize(100L).build();
+    when(blobReadSession.readAs(any()))
+        .thenReturn(ApiFutures.immediateFuture(disposableByteString));
+    when(disposableByteString.byteString()).thenReturn(sequentialBytes(0, 100));
+
+    try (GcsBidiReadChannel bufferedReader = createChannelWithItemInfo(itemInfo)) {
+      for (int step = 0; step < 5; step++) {
+        ByteBuffer dst = ByteBuffer.allocate(10);
+        int n = bufferedReader.read(dst);
+        assertThat(n).isEqualTo(10);
+        dst.flip();
+        assertThat(dst.get(0)).isEqualTo((byte) (step * 10));
+      }
+      assertThat(bufferedReader.position()).isEqualTo(50L);
+    }
+    verify(blobReadSession, times(1)).readAs(any());
+  }
+
+  @Test
+  void positionedRead_servesWithoutMutatingChannelPositionAndSharesBuffer() throws Exception {
+    GcsItemInfo itemInfo = GcsItemInfo.builder().setItemId(itemId).setSize(100L).build();
+    when(blobReadSession.readAs(any()))
+        .thenReturn(ApiFutures.immediateFuture(disposableByteString));
+    when(disposableByteString.byteString()).thenReturn(sequentialBytes(0, 100));
+
+    try (GcsBidiReadChannel bufferedReader = createChannelWithItemInfo(itemInfo)) {
+      bufferedReader.position(12L);
+      ByteBuffer dst1 = ByteBuffer.allocate(8);
+      assertThat(bufferedReader.read(0L, dst1)).isEqualTo(8);
+      assertThat(bufferedReader.position()).isEqualTo(12L);
+
+      ByteBuffer dst2 = ByteBuffer.allocate(8);
+      assertThat(bufferedReader.read(40L, dst2)).isEqualTo(8);
+      dst2.flip();
+      assertThat(dst2.get(0)).isEqualTo((byte) 40);
+      assertThat(bufferedReader.position()).isEqualTo(12L);
+    }
+    verify(blobReadSession, times(1)).readAs(any());
+  }
+
+  @Test
+  void close_withSessionPoolAndPendingVectoredRead_returnsSessionAfterCallbackCompletes()
+      throws Exception {
+    com.google.api.core.SettableApiFuture<DisposableByteString> pendingRead =
+        com.google.api.core.SettableApiFuture.create();
+    when(blobReadSession.readAs(any())).thenReturn(pendingRead);
+
+    try (BidiSessionPool pool = new BidiSessionPool()) {
+      GcsReadOptions readOptions = GcsReadOptions.builder().setBidiTimeout(10).build();
+      GcsBidiReadChannel pooledReader =
+          new GcsBidiReadChannel(
+              storage, itemId, readOptions, executorServiceSupplier, telemetry, null, pool);
+
+      GcsObjectRange range = newRange(0, 5);
+      pooledReader.readVectored(Arrays.asList(range), ByteBuffer::allocate);
+      pooledReader.close();
+      verify(blobReadSession, never()).close();
+
+      when(disposableByteString.byteString()).thenReturn(sequentialBytes(0, 5));
+      pendingRead.set(disposableByteString);
+      assertThat(range.getByteBufferFuture().get().remaining()).isEqualTo(5);
+
+      GcsBidiReadChannel reusedReader =
+          new GcsBidiReadChannel(
+              storage, itemId, readOptions, executorServiceSupplier, telemetry, null, pool);
+      reusedReader.close();
+      // 1 from setUp() + 1 from pooledReader; reusedReader reuses pooled session.
+      verify(storage, times(2)).blobReadSession(any(BlobId.class));
+    }
+    verify(blobReadSession, times(1)).close();
+  }
+
   private GcsBidiReadChannel createChannelWithItemInfo(GcsItemInfo itemInfo) throws IOException {
     GcsReadOptions readOptions = GcsReadOptions.builder().setBidiTimeout(10).build();
     return new GcsBidiReadChannel(

@@ -83,7 +83,7 @@ public class GcsFooterOptimizer implements FormatOptimizer {
   }
 
   @Override
-  public int read(long position, ByteBuffer dst, VectoredSeekableByteChannel source)
+  public synchronized int read(long position, ByteBuffer dst, VectoredSeekableByteChannel source)
       throws IOException {
     if (fileSize == -1) {
       resolveFileSizeFromItemInfo(source);
@@ -230,16 +230,27 @@ public class GcsFooterOptimizer implements FormatOptimizer {
       long startPosition, long estimatedPrefetchSize, VectoredSeekableByteChannel source)
       throws IOException {
     ByteBuffer buffer = ByteBuffer.allocate(Math.toIntExact(estimatedPrefetchSize * 2));
-    long originalPosition = source.position();
-    try {
-      source.position(startPosition);
+    if (source.isPositionedReadSupported()) {
+      long pos = startPosition;
       while (buffer.hasRemaining()) {
-        if (source.read(buffer) <= 0) {
+        int n = source.read(pos, buffer);
+        if (n <= 0) {
           break;
         }
+        pos += n;
       }
-    } finally {
-      source.position(originalPosition);
+    } else {
+      long originalPosition = source.position();
+      try {
+        source.position(startPosition);
+        while (buffer.hasRemaining()) {
+          if (source.read(buffer) <= 0) {
+            break;
+          }
+        }
+      } finally {
+        source.position(originalPosition);
+      }
     }
     buffer.flip();
 
@@ -294,6 +305,21 @@ public class GcsFooterOptimizer implements FormatOptimizer {
     long startPosition = fileSize - prefetchSize;
     int bufferSize = Math.toIntExact(prefetchSize);
     ByteBuffer cacheBuffer = ByteBuffer.allocate(bufferSize);
+    if (source.isPositionedReadSupported()) {
+      long pos = startPosition;
+      while (cacheBuffer.hasRemaining()) {
+        int n = source.read(pos, cacheBuffer);
+        if (n == -1) {
+          throw new IOException("Unexpected EOF encountered while reading footer.");
+        }
+        if (n == 0) {
+          break;
+        }
+        pos += n;
+      }
+      cacheBuffer.flip();
+      return cacheBuffer;
+    }
     long originalPosition = source.position();
     try {
       source.position(startPosition);
